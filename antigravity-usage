@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Antigravity Usage — Unified CLI/IDE token usage and cost tracker.
+
+Aggregates token usage from all local Antigravity and Gemini CLI/IDE sessions,
+then estimates costs using a smart pricing engine that auto-updates from the
+community-standard LiteLLM database.
+
+Architecture:
+    UsageCollector (base) → GeminiCLICollector, AntigravityCLICollector, AntigravityIDECollector
+    Each collector returns a list of usage dicts with: month, model, source, input, output, cached, thoughts, tool
+"""
+
+import json
+import glob
+import os
+import time
+import urllib.request
+from pathlib import Path
+from collections import defaultdict
+
+
+# ---------------------------------------------------------------------------
+# Collectors
+# ---------------------------------------------------------------------------
+
+class UsageCollector:
+    """Base class for usage data collectors."""
+
+    name = "unknown"
+
+    def collect(self):
+        """Return a list of usage entry dicts."""
+        return []
+
+
+class GeminiCLICollector(UsageCollector):
+    """Parses Gemini CLI session JSONL files from ~/.gemini/tmp/*/chats/*.jsonl"""
+
+    name = "gemini-cli"
+
+    def __init__(self):
+        self.base_dir = Path.home() / ".gemini/tmp"
+
+    def collect(self):
+        all_usage = []
+        chat_files = glob.glob(str(self.base_dir / "**/chats/*.jsonl"), recursive=True)
+        for filepath in chat_files:
+            all_usage.extend(self._parse_session(filepath))
+        return all_usage
+
+    def _parse_session(self, filepath):
+        usage_data = []
+        try:
+            with open(filepath, 'r') as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                        if data.get('type') == 'gemini' and 'tokens' in data:
+                            timestamp = data.get('timestamp')
+                            month = timestamp[:7] if timestamp else "unknown"
+                            usage_data.append({
+                                'month': month,
+                                'model': data.get('model', 'unknown'),
+                                'source': self.name,
+                                'input': data['tokens'].get('input', 0),
+                                'output': data['tokens'].get('output', 0),
+                                'cached': data['tokens'].get('cached', 0),
+                                'thoughts': data['tokens'].get('thoughts', 0),
+                                'tool': data['tokens'].get('tool', 0),
+                            })
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+        except (OSError, IOError):
+            pass
+        return usage_data
+
+
+class AntigravityCLICollector(UsageCollector):
+    """Future: Parse Antigravity CLI conversation protobuf files.
+
+    Currently a no-op — Antigravity CLI stores conversations in .pb files
+    without a published schema. The transcript.jsonl files exist but contain
+    no token or model metadata. This collector is a placeholder for when
+    the data becomes accessible.
+    """
+
+    name = "antigravity-cli"
+
+    def collect(self):
+        # TODO: Implement when Antigravity CLI exposes token data
+        # Path: ~/.gemini/antigravity-cli/conversations/*.pb
+        # Path: ~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl
+        return []
+
+
+class AntigravityIDECollector(UsageCollector):
+    """Future: Parse Antigravity IDE conversation and implicit protobuf files.
+
+    Currently a no-op — same protobuf limitation as AntigravityCLICollector.
+    """
+
+    name = "antigravity-ide"
+
+    def collect(self):
+        # TODO: Implement when Antigravity IDE exposes token data
+        # Path: ~/.gemini/antigravity-ide/conversations/*.pb
+        # Path: ~/.gemini/antigravity-ide/implicit/*.pb
+        return []
+
+
+# All registered collectors
+COLLECTORS = [
+    GeminiCLICollector(),
+    AntigravityCLICollector(),
+    AntigravityIDECollector(),
+]
+
+
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+
+def aggregate_usage(usage_list):
+    """Aggregate usage entries into month -> model -> stats, tracking sources."""
+    aggregated = defaultdict(lambda: defaultdict(lambda: {
+        'input': 0, 'output': 0, 'cached': 0, 'thoughts': 0, 'tool': 0, 'total': 0
+    }))
+    # Also track per-source totals: month -> source -> total_tokens
+    source_totals = defaultdict(lambda: defaultdict(int))
+
+    for item in usage_list:
+        m = item['month']
+        model = item['model']
+        source = item.get('source', 'unknown')
+
+        aggregated[m][model]['input'] += item['input']
+        aggregated[m][model]['output'] += item['output']
+        aggregated[m][model]['cached'] += item['cached']
+        aggregated[m][model]['thoughts'] += item['thoughts']
+        aggregated[m][model]['tool'] += item['tool']
+
+        entry_total = item['input'] + item['output'] + item['cached'] + item['thoughts'] + item['tool']
+        aggregated[m][model]['total'] += entry_total
+        source_totals[m][source] += entry_total
+
+    return aggregated, source_totals
+
+
+# ---------------------------------------------------------------------------
+# Pricing Engine
+# ---------------------------------------------------------------------------
+
+REPO_PRICING_URL = "https://raw.githubusercontent.com/gigaprakosa/antigravity-usage/main/pricing.json"
+LITELLM_PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+CACHE_FILE = Path.home() / ".gemini/antigravity-usage-pricing.json"
+CACHE_TTL = 86400  # 24 hours
+
+# Hardcoded defaults — May 2026 pricing
+DEFAULT_PRICING = {
+    "models": {
+        "gemini-3.1-flash": {"input": 0.50, "output": 3.00},
+        "gemini-3.1-flash-lite": {"input": 0.25, "output": 1.50},
+        "gemini-3.1-pro": {"input": 2.00, "output": 12.00},
+        "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
+        "gemini-2.5-pro": {"input": 1.25, "output": 10.00},
+        "claude-opus-4": {"input": 15.00, "output": 75.00},
+        "claude-sonnet-4": {"input": 3.00, "output": 15.00},
+    },
+    "rules": {
+        "cache_read_factor": 0.10,
+        "thought_billed_as": "output",
+    },
+}
+
+# Providers to extract from LiteLLM
+LITELLM_PROVIDER_PREFIXES = ("gemini", "claude", "anthropic")
+
+
+def fetch_json(url):
+    """Fetch JSON from a URL with a 5-second timeout."""
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            return json.loads(response.read().decode())
+    except Exception:
+        return None
+
+
+def load_pricing():
+    """Load pricing data with tiered fallback: cache → LiteLLM → repo → defaults."""
+
+    # 1. Try valid cache
+    if CACHE_FILE.exists():
+        if time.time() - CACHE_FILE.stat().st_mtime < CACHE_TTL:
+            try:
+                with open(CACHE_FILE, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+
+    # 2. Try fetching from LiteLLM (community standard)
+    community_data = fetch_json(LITELLM_PRICING_URL)
+    if community_data:
+        transformed = {"models": {}, "rules": DEFAULT_PRICING["rules"]}
+        for key, val in community_data.items():
+            key_lower = key.lower()
+            if any(p in key_lower for p in LITELLM_PROVIDER_PREFIXES):
+                input_cost = val.get("input_cost_per_token", 0) * 1_000_000
+                output_cost = val.get("output_cost_per_token", 0) * 1_000_000
+                if input_cost > 0:
+                    clean_key = key.split("/")[-1]
+                    transformed["models"][clean_key] = {
+                        "input": input_cost,
+                        "output": output_cost,
+                    }
+
+        os.makedirs(CACHE_FILE.parent, exist_ok=True)
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(transformed, f)
+        return transformed
+
+    # 3. Try fetching from repo (curated)
+    repo_data = fetch_json(REPO_PRICING_URL)
+    if repo_data:
+        os.makedirs(CACHE_FILE.parent, exist_ok=True)
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(repo_data, f)
+        return repo_data
+
+    # 4. Fallback to expired cache
+    if CACHE_FILE.exists():
+        try:
+            with open(CACHE_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    return DEFAULT_PRICING
+
+
+# Global pricing data
+PRICING_DATA = load_pricing()
+
+
+def get_pricing_for_model(model_name):
+    """Look up pricing for a model with fuzzy matching."""
+    model_name = model_name.lower()
+    models = PRICING_DATA.get("models", {})
+
+    # Try exact match
+    if model_name in models:
+        return models[model_name]
+
+    # Try fuzzy match (e.g., "gemini-3.1-pro-preview" → "gemini-3.1-pro")
+    for key in sorted(models.keys(), key=len, reverse=True):
+        if key in model_name or model_name in key:
+            return models[key]
+
+    # Fallback to standard Flash pricing
+    return models.get(
+        "gemini-3.1-flash",
+        DEFAULT_PRICING["models"]["gemini-3.1-flash"],
+    )
+
+
+def calculate_cost(model_name, stats):
+    """Calculate estimated cost for a model's aggregated stats."""
+    pricing = get_pricing_for_model(model_name)
+    rules = PRICING_DATA.get("rules", DEFAULT_PRICING["rules"])
+
+    # Tool tokens are input tokens (tool results sent back to the model)
+    input_total = stats['input'] + stats.get('tool', 0)
+    input_cost = (input_total / 1_000_000) * pricing["input"]
+
+    cache_factor = rules.get("cache_read_factor", 0.10)
+    cache_read_cost = (stats['cached'] / 1_000_000) * (pricing["input"] * cache_factor)
+
+    output_rate = pricing["output"]
+    thought_cost = (stats['thoughts'] / 1_000_000) * output_rate
+    output_cost = (stats['output'] / 1_000_000) * output_rate
+
+    return input_cost + cache_read_cost + thought_cost + output_cost
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def print_table(aggregated, source_totals):
+    """Print the usage summary table."""
+    months = sorted(aggregated.keys())
+
+    if not months:
+        print("No usage data found.")
+        return
+
+    if len(months) == 1:
+        print("📊 Antigravity Usage:")
+    else:
+        print(f"📊 Antigravity Usage (last {len(months)} months):")
+
+    for month in months:
+        monthly_total_tokens = 0
+        monthly_total_cost = 0.0
+
+        for model_name, stats in aggregated[month].items():
+            monthly_total_tokens += stats['total']
+            monthly_total_cost += calculate_cost(model_name, stats)
+
+        print(f"• {month}: {monthly_total_tokens:,} tokens, Cost: ${monthly_total_cost:.2f}")
+
+        # Show per-source breakdown if there are multiple sources
+        sources = source_totals.get(month, {})
+        active_sources = {s: t for s, t in sources.items() if t > 0}
+        if active_sources:
+            for source, total in sorted(active_sources.items()):
+                print(f"  └─ {source}: {total:,} tokens")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    all_usage = []
+    for collector in COLLECTORS:
+        all_usage.extend(collector.collect())
+
+    if not all_usage:
+        print("No usage data found.")
+    else:
+        agg, src_totals = aggregate_usage(all_usage)
+        print_table(agg, src_totals)
