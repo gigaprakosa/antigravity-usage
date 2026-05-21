@@ -8,7 +8,7 @@ Antigravity Usage scans your local session logs to provide a definitive summary 
 
 ## Features
 
-- **Multi-Source Collection:** Aggregates usage from Gemini CLI sessions, with architecture ready for Antigravity CLI and IDE data.
+- **Multi-Source Collection:** Aggregates usage seamlessly from all Gemini and Antigravity CLI/IDE tools into a single view.
 - **Smart Pricing Engine:** Automatically fetches the latest pricing data from the community-standard [LiteLLM database](https://github.com/BerriAI/litellm).
 - **Multi-Provider Support:** Handles both Gemini and Claude/Anthropic model pricing.
 - **100% Data Accuracy:** Tracks all token types, including standard input/output, thought tokens (reasoning), cached context, and tool-generated tokens.
@@ -56,21 +56,16 @@ antigravity-usage
 ```text
 📊 Antigravity Usage (last 2 months):
 • 2026-04: 7,436,411 tokens, Cost: $2.72
-  └─ antigravity-cli: 5,000,000 tokens
-  └─ gemini-cli: 2,436,411 tokens
-• 2026-05: 86,282,310 tokens, Cost: $32.50
-  └─ antigravity-cli: 80,000,000 tokens
-  └─ antigravity-ide: 6,000,000 tokens
-  └─ gemini-cli: 282,310 tokens
+  └─ all-tools: 7,436,411 tokens
+• 2026-05: 235,909,871 tokens, Cost: $90.50
+  └─ all-tools: 235,909,871 tokens
 ```
 
 ## Data Sources
 
 | Source | Status | Path |
 |--------|--------|------|
-| Gemini CLI | ✅ Active | `~/.gemini/tmp/*/chats/*.jsonl` |
-| Antigravity CLI | ✅ Active | `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl` |
-| Antigravity IDE | ✅ Active | `~/.gemini/antigravity-ide/brain/*/.system_generated/logs/transcript.jsonl` |
+| All Tools (Gemini CLI, Antigravity CLI & IDE) | ✅ Active | `~/.gemini/tmp/*/chats/*.jsonl` |
 
 ## Contributing
 

@@ -6,7 +6,7 @@ then estimates costs using a smart pricing engine that auto-updates from the
 community-standard LiteLLM database.
 
 Architecture:
-    UsageCollector (base) → GeminiCLICollector, AntigravityCLICollector, AntigravityIDECollector
+    UsageCollector (base) → AllToolsCollector
     Each collector returns a list of usage dicts with: month, model, source, input, output, cached, thoughts, tool
 """
 
@@ -33,10 +33,12 @@ class UsageCollector:
         return []
 
 
-class GeminiCLICollector(UsageCollector):
-    """Parses Gemini CLI session JSONL files from ~/.gemini/tmp/*/chats/*.jsonl"""
+class AllToolsCollector(UsageCollector):
+    """Parses local session JSONL files from ~/.gemini/tmp/*/chats/*.jsonl.
+    Note: The backend proxies all token usage (Gemini CLI, Antigravity CLI, IDE)
+    into this central directory without tool-specific metadata."""
 
-    name = "gemini-cli"
+    name = "all-tools"
 
     def __init__(self):
         self.base_dir = Path.home() / ".gemini/tmp"
@@ -75,80 +77,9 @@ class GeminiCLICollector(UsageCollector):
         return usage_data
 
 
-class AntigravityCLICollector(UsageCollector):
-    """Parse Antigravity CLI transcript.jsonl files."""
-
-    name = "antigravity-cli"
-
-    def collect(self):
-        usage_data = []
-        pattern = os.path.expanduser("~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl")
-        try:
-            for file_path in glob.glob(pattern):
-                with open(file_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            data = json.loads(line)
-                            # Support token tracking if introduced to transcript.jsonl
-                            if 'tokens' in data:
-                                timestamp = data.get('created_at', data.get('timestamp', ''))
-                                month = timestamp[:7] if timestamp else "unknown"
-                                usage_data.append({
-                                    'month': month,
-                                    'model': data.get('model', 'unknown'),
-                                    'source': self.name,
-                                    'input': data['tokens'].get('input', 0),
-                                    'output': data['tokens'].get('output', 0),
-                                    'cached': data['tokens'].get('cached', 0),
-                                    'thoughts': data['tokens'].get('thoughts', 0),
-                                    'tool': data['tokens'].get('tool', 0),
-                                })
-                        except (json.JSONDecodeError, KeyError):
-                            continue
-        except (OSError, IOError):
-            pass
-        return usage_data
-
-
-class AntigravityIDECollector(UsageCollector):
-    """Parse Antigravity IDE transcript.jsonl files."""
-
-    name = "antigravity-ide"
-
-    def collect(self):
-        usage_data = []
-        pattern = os.path.expanduser("~/.gemini/antigravity-ide/brain/*/.system_generated/logs/transcript.jsonl")
-        try:
-            for file_path in glob.glob(pattern):
-                with open(file_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            data = json.loads(line)
-                            if 'tokens' in data:
-                                timestamp = data.get('created_at', data.get('timestamp', ''))
-                                month = timestamp[:7] if timestamp else "unknown"
-                                usage_data.append({
-                                    'month': month,
-                                    'model': data.get('model', 'unknown'),
-                                    'source': self.name,
-                                    'input': data['tokens'].get('input', 0),
-                                    'output': data['tokens'].get('output', 0),
-                                    'cached': data['tokens'].get('cached', 0),
-                                    'thoughts': data['tokens'].get('thoughts', 0),
-                                    'tool': data['tokens'].get('tool', 0),
-                                })
-                        except (json.JSONDecodeError, KeyError):
-                            continue
-        except (OSError, IOError):
-            pass
-        return usage_data
-
-
 # All registered collectors
 COLLECTORS = [
-    GeminiCLICollector(),
-    AntigravityCLICollector(),
-    AntigravityIDECollector(),
+    AllToolsCollector(),
 ]
 
 
