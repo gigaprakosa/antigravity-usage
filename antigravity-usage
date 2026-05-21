@@ -76,36 +76,72 @@ class GeminiCLICollector(UsageCollector):
 
 
 class AntigravityCLICollector(UsageCollector):
-    """Future: Parse Antigravity CLI conversation protobuf files.
-
-    Currently a no-op — Antigravity CLI stores conversations in .pb files
-    without a published schema. The transcript.jsonl files exist but contain
-    no token or model metadata. This collector is a placeholder for when
-    the data becomes accessible.
-    """
+    """Parse Antigravity CLI transcript.jsonl files."""
 
     name = "antigravity-cli"
 
     def collect(self):
-        # TODO: Implement when Antigravity CLI exposes token data
-        # Path: ~/.gemini/antigravity-cli/conversations/*.pb
-        # Path: ~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl
-        return []
+        usage_data = []
+        pattern = os.path.expanduser("~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl")
+        try:
+            for file_path in glob.glob(pattern):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            data = json.loads(line)
+                            # Support token tracking if introduced to transcript.jsonl
+                            if 'tokens' in data:
+                                timestamp = data.get('created_at', data.get('timestamp', ''))
+                                month = timestamp[:7] if timestamp else "unknown"
+                                usage_data.append({
+                                    'month': month,
+                                    'model': data.get('model', 'unknown'),
+                                    'source': self.name,
+                                    'input': data['tokens'].get('input', 0),
+                                    'output': data['tokens'].get('output', 0),
+                                    'cached': data['tokens'].get('cached', 0),
+                                    'thoughts': data['tokens'].get('thoughts', 0),
+                                    'tool': data['tokens'].get('tool', 0),
+                                })
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+        except (OSError, IOError):
+            pass
+        return usage_data
 
 
 class AntigravityIDECollector(UsageCollector):
-    """Future: Parse Antigravity IDE conversation and implicit protobuf files.
-
-    Currently a no-op — same protobuf limitation as AntigravityCLICollector.
-    """
+    """Parse Antigravity IDE transcript.jsonl files."""
 
     name = "antigravity-ide"
 
     def collect(self):
-        # TODO: Implement when Antigravity IDE exposes token data
-        # Path: ~/.gemini/antigravity-ide/conversations/*.pb
-        # Path: ~/.gemini/antigravity-ide/implicit/*.pb
-        return []
+        usage_data = []
+        pattern = os.path.expanduser("~/.gemini/antigravity-ide/brain/*/.system_generated/logs/transcript.jsonl")
+        try:
+            for file_path in glob.glob(pattern):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            data = json.loads(line)
+                            if 'tokens' in data:
+                                timestamp = data.get('created_at', data.get('timestamp', ''))
+                                month = timestamp[:7] if timestamp else "unknown"
+                                usage_data.append({
+                                    'month': month,
+                                    'model': data.get('model', 'unknown'),
+                                    'source': self.name,
+                                    'input': data['tokens'].get('input', 0),
+                                    'output': data['tokens'].get('output', 0),
+                                    'cached': data['tokens'].get('cached', 0),
+                                    'thoughts': data['tokens'].get('thoughts', 0),
+                                    'tool': data['tokens'].get('tool', 0),
+                                })
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+        except (OSError, IOError):
+            pass
+        return usage_data
 
 
 # All registered collectors

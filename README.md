@@ -30,10 +30,17 @@ Antigravity Usage scans your local session logs to provide a definitive summary 
    chmod +x antigravity-usage
    ```
 
-3. (Optional) Add an alias to your shell profile (e.g., `~/.zshrc` or `~/.bashrc`) for easier access:
+3. (Optional) Add an alias or symlink to your shell profile (e.g., `~/.zshrc` or `~/.bashrc`) for easier access:
+
+   **Option A: Alias**
    ```bash
    echo "alias antigravity-usage='$(pwd)/antigravity-usage'" >> ~/.zshrc
    source ~/.zshrc
+   ```
+
+   **Option B: Symlink**
+   ```bash
+   sudo ln -s $(pwd)/antigravity-usage /usr/local/bin/antigravity-usage
    ```
 
 ## Usage
@@ -49,9 +56,12 @@ antigravity-usage
 ```text
 📊 Antigravity Usage (last 2 months):
 • 2026-04: 7,436,411 tokens, Cost: $2.72
-  └─ gemini-cli: 7,436,411 tokens
+  └─ antigravity-cli: 5,000,000 tokens
+  └─ gemini-cli: 2,436,411 tokens
 • 2026-05: 86,282,310 tokens, Cost: $32.50
-  └─ gemini-cli: 86,282,310 tokens
+  └─ antigravity-cli: 80,000,000 tokens
+  └─ antigravity-ide: 6,000,000 tokens
+  └─ gemini-cli: 282,310 tokens
 ```
 
 ## Data Sources
@@ -59,8 +69,8 @@ antigravity-usage
 | Source | Status | Path |
 |--------|--------|------|
 | Gemini CLI | ✅ Active | `~/.gemini/tmp/*/chats/*.jsonl` |
-| Antigravity CLI | 🔜 Planned | `~/.gemini/antigravity-cli/conversations/*.pb` |
-| Antigravity IDE | 🔜 Planned | `~/.gemini/antigravity-ide/conversations/*.pb` |
+| Antigravity CLI | ✅ Active | `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl` |
+| Antigravity IDE | ✅ Active | `~/.gemini/antigravity-ide/brain/*/.system_generated/logs/transcript.jsonl` |
 
 ## Contributing
 
