@@ -286,13 +286,6 @@ def print_table(aggregated, source_totals):
 
         print(f"• {month}: {monthly_total_tokens:,} tokens, Cost: ${monthly_total_cost:.2f}")
 
-        # Show per-source breakdown if there are multiple sources
-        sources = source_totals.get(month, {})
-        active_sources = {s: t for s, t in sources.items() if t > 0}
-        if active_sources:
-            for source, total in sorted(active_sources.items()):
-                print(f"  └─ {source}: {total:,} tokens")
-
 
 # ---------------------------------------------------------------------------
 # Main

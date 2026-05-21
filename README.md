@@ -56,9 +56,7 @@ antigravity-usage
 ```text
 📊 Antigravity Usage (last 2 months):
 • 2026-04: 7,436,411 tokens, Cost: $2.72
-  └─ all-tools: 7,436,411 tokens
 • 2026-05: 235,909,871 tokens, Cost: $90.50
-  └─ all-tools: 235,909,871 tokens
 ```
 
 ## Data Sources
