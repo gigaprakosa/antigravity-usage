@@ -197,10 +197,15 @@ def load_pricing():
             except Exception:
                 pass
 
+    # Initialize with default pricing
+    pricing = {
+        "models": dict(DEFAULT_PRICING["models"]),
+        "rules": dict(DEFAULT_PRICING["rules"])
+    }
+
     # 2. Try fetching from LiteLLM (community standard)
     community_data = fetch_json(LITELLM_PRICING_URL)
     if community_data:
-        transformed = {"models": {}, "rules": DEFAULT_PRICING["rules"]}
         for key, val in community_data.items():
             key_lower = key.lower()
             if any(p in key_lower for p in LITELLM_PROVIDER_PREFIXES):
@@ -208,33 +213,36 @@ def load_pricing():
                 output_cost = val.get("output_cost_per_token", 0) * 1_000_000
                 if input_cost > 0:
                     clean_key = key.split("/")[-1]
-                    transformed["models"][clean_key] = {
+                    pricing["models"][clean_key] = {
                         "input": input_cost,
                         "output": output_cost,
                     }
 
-        os.makedirs(CACHE_FILE.parent, exist_ok=True)
-        with open(CACHE_FILE, 'w') as f:
-            json.dump(transformed, f)
-        return transformed
-
-    # 3. Try fetching from repo (curated)
+    # 3. Try fetching from repo (curated overrides)
     repo_data = fetch_json(REPO_PRICING_URL)
     if repo_data:
-        os.makedirs(CACHE_FILE.parent, exist_ok=True)
-        with open(CACHE_FILE, 'w') as f:
-            json.dump(repo_data, f)
-        return repo_data
+        if "models" in repo_data:
+            pricing["models"].update(repo_data["models"])
+        if "rules" in repo_data:
+            pricing["rules"].update(repo_data["rules"])
 
-    # 4. Fallback to expired cache
-    if CACHE_FILE.exists():
+    # 4. Fallback to expired cache if fetching failed completely
+    if not community_data and not repo_data and CACHE_FILE.exists():
         try:
             with open(CACHE_FILE, 'r') as f:
                 return json.load(f)
         except Exception:
             pass
 
-    return DEFAULT_PRICING
+    # Save to cache
+    try:
+        os.makedirs(CACHE_FILE.parent, exist_ok=True)
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(pricing, f)
+    except Exception:
+        pass
+
+    return pricing
 
 
 # Global pricing data
@@ -274,8 +282,11 @@ def calculate_cost(model_name, stats):
     cache_factor = rules.get("cache_read_factor", 0.10)
     cache_read_cost = (stats['cached'] / 1_000_000) * (pricing["input"] * cache_factor)
 
+    thought_billing = rules.get("thought_billed_as", "output")
+    thought_rate = pricing.get(thought_billing, pricing["output"])
+    thought_cost = (stats['thoughts'] / 1_000_000) * thought_rate
+
     output_rate = pricing["output"]
-    thought_cost = (stats['thoughts'] / 1_000_000) * output_rate
     output_cost = (stats['output'] / 1_000_000) * output_rate
 
     return input_cost + cache_read_cost + thought_cost + output_cost
@@ -321,6 +332,10 @@ def print_table(aggregated, source_totals):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Antigravity Usage — Unified CLI/IDE token usage and cost tracker.")
+    parser.parse_args()
+
     all_usage = []
     for collector in COLLECTORS:
         all_usage.extend(collector.collect())
