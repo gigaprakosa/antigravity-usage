@@ -7,9 +7,9 @@ Thank you for your interest in contributing! We welcome all improvements, from b
 To keep the tool lightweight, fast, and secure, all contributions must adhere to these standards:
 
 1.  **Zero External Dependencies:** Use only the Python 3 standard library. Do not add `requirements.txt` or any third-party packages.
-2.  **Smart Pricing Integrity:** If adding support for new models, ensure they are compatible with the fuzzy matching logic in the Smart Pricing Engine.
-3.  **Data Accuracy:** Changes to the parsing logic must be verified against raw session logs.
-4.  **Collector Pattern:** New data sources should be implemented as a subclass of `UsageCollector` and registered in the `COLLECTORS` list.
+2.  **Antigravity-only Scope:** Track Google Antigravity (CLI + IDE) only. Do not reintroduce the deprecated Gemini CLI as a data source.
+3.  **Live Pricing Only:** Rates must be fetched live online (LiteLLM) every run. Never bundle a static `pricing.json`.
+4.  **Single Responsibility:** Each concern stays an isolated class (`AntigravityAuth`, `CloudCodeClient`, `PricingEngine`, `UsageLedger`, `Renderer`).
 
 ## Commit & Pull Request Rules
 
@@ -22,9 +22,9 @@ To keep the tool lightweight, fast, and secure, all contributions must adhere to
 The project is a standalone Python script. No installation is required.
 
 ### Testing Your Changes
-1.  Run the script locally: `./antigravity-usage`
-2.  Verify the output format remains consistent with the bullet-point style with source breakdown.
-3.  If you are testing pricing updates, you can temporarily modify `pricing.json` to see how overrides are handled.
+1.  Run the script locally: `./antigravity-usage` (live account + history).
+2.  Test history/pricing in isolation: `./antigravity-usage --no-live` after appending a sample line to `~/.gemini/antigravity-cli/usage-ledger.jsonl`.
+3.  Verify the hook end-to-end: `./antigravity-usage --install-hook`, then run an Antigravity turn and confirm a new ledger line.
 
 ## Code of Conduct
 
