@@ -12,6 +12,9 @@ __pycache__/
 ehthumbs.db
 Thumbs.db
 
+# Local agent tooling state (oh-my-claudecode)
+.omc/
+
 # Gemini CLI local artifacts
 .gemini/
 .gemini_security/

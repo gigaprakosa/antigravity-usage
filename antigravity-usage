@@ -1,307 +1,588 @@
 #!/usr/bin/env python3
-"""Antigravity Usage — Unified CLI/IDE token usage and cost tracker.
+"""Antigravity Usage — live quota + token-cost tracker for Google Antigravity.
 
-Aggregates token usage from all local Antigravity and Gemini CLI/IDE sessions,
-then estimates costs using a smart pricing engine that auto-updates from the
-community-standard LiteLLM database.
+Scope: Google Antigravity only (CLI + IDE). The legacy Gemini CLI is deprecated
+(EOL 2026-06-18) and is intentionally NOT a data source here.
 
-Architecture:
-    UsageCollector (base) → AllToolsCollector
-    Each collector returns a list of usage dicts with: month, model, source, input, output, cached, thoughts, tool
+Antigravity does not persist historical token usage in any readable form (the
+local conversation store is encrypted; per-response UsageMetadata is discarded).
+This tool therefore reports usage from the two sources that ARE authoritative:
+
+  1. Live account state — Google CloudCode API (tier + per-model quota remaining).
+  2. Forward-captured tokens — a local ledger written by an Antigravity `Stop`
+     hook (install with `antigravity-usage --install-hook`), priced with live
+     online rates (LiteLLM) every run. No bundled pricing.json.
+
+Design (SOLID): each concern is an isolated unit —
+  AntigravityAuth     → mint a Bearer from the IDE-stored refresh token
+  CloudCodeClient     → call loadCodeAssist / retrieveUserQuota
+  PricingEngine       → live online pricing with last-good cache fallback
+  UsageLedger         → read + aggregate the hook-written token ledger
+  Renderer            → format output
 """
 
-import json
+import argparse
+import base64
 import glob
+import json
 import os
+import re
+import sqlite3
+import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
-from pathlib import Path
 from collections import defaultdict
+from pathlib import Path
 
+HOME = Path.home()
+CLOUDCODE_HOST = "https://cloudcode-pa.googleapis.com"
+OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+IDE_STATE_DB = HOME / "Library/Application Support/Antigravity/User/globalStorage/state.vscdb"
+AGY_OAUTH_CREDS = HOME / ".gemini/oauth_creds.json"
+AGY_BINARY = HOME / ".local/bin/agy"
+LEDGER_FILE = HOME / ".gemini/antigravity-cli/usage-ledger.jsonl"
+TOKEN_CACHE = HOME / ".gemini/antigravity-usage-token.json"
+PRICING_CACHE = HOME / ".gemini/antigravity-usage-pricing-cache.json"
 
-# ---------------------------------------------------------------------------
-# Collectors
-# ---------------------------------------------------------------------------
-
-class UsageCollector:
-    """Base class for usage data collectors."""
-
-    name = "unknown"
-
-    def collect(self):
-        """Return a list of usage entry dicts."""
-        return []
-
-
-class AllToolsCollector(UsageCollector):
-    """Parses local session JSONL files from ~/.gemini/tmp/*/chats/*.jsonl.
-    Note: The backend proxies all token usage (Gemini CLI, Antigravity CLI, IDE)
-    into this central directory without tool-specific metadata."""
-
-    name = "all-tools"
-
-    def __init__(self):
-        self.base_dir = Path.home() / ".gemini/tmp"
-
-    def collect(self):
-        all_usage = []
-        chat_files = glob.glob(str(self.base_dir / "**/chats/*.jsonl"), recursive=True)
-        for filepath in chat_files:
-            all_usage.extend(self._parse_session(filepath))
-        return all_usage
-
-    def _parse_session(self, filepath):
-        usage_data = []
-        try:
-            with open(filepath, 'r') as f:
-                for line in f:
-                    try:
-                        data = json.loads(line)
-                        if data.get('type') == 'gemini' and 'tokens' in data:
-                            timestamp = data.get('timestamp')
-                            month = timestamp[:7] if timestamp else "unknown"
-                            usage_data.append({
-                                'month': month,
-                                'model': data.get('model', 'unknown'),
-                                'source': self.name,
-                                'input': data['tokens'].get('input', 0),
-                                'output': data['tokens'].get('output', 0),
-                                'cached': data['tokens'].get('cached', 0),
-                                'thoughts': data['tokens'].get('thoughts', 0),
-                                'tool': data['tokens'].get('tool', 0),
-                            })
-                    except (json.JSONDecodeError, KeyError):
-                        continue
-        except (OSError, IOError):
-            pass
-        return usage_data
-
-
-# All registered collectors
-COLLECTORS = [
-    AllToolsCollector(),
-]
-
-
-# ---------------------------------------------------------------------------
-# Aggregation
-# ---------------------------------------------------------------------------
-
-def aggregate_usage(usage_list):
-    """Aggregate usage entries into month -> model -> stats, tracking sources."""
-    aggregated = defaultdict(lambda: defaultdict(lambda: {
-        'input': 0, 'output': 0, 'cached': 0, 'thoughts': 0, 'tool': 0, 'total': 0
-    }))
-    # Also track per-source totals: month -> source -> total_tokens
-    source_totals = defaultdict(lambda: defaultdict(int))
-
-    for item in usage_list:
-        m = item['month']
-        model = item['model']
-        source = item.get('source', 'unknown')
-
-        aggregated[m][model]['input'] += item['input']
-        aggregated[m][model]['output'] += item['output']
-        aggregated[m][model]['cached'] += item['cached']
-        aggregated[m][model]['thoughts'] += item['thoughts']
-        aggregated[m][model]['tool'] += item['tool']
-
-        entry_total = item['input'] + item['output'] + item['cached'] + item['thoughts'] + item['tool']
-        aggregated[m][model]['total'] += entry_total
-        source_totals[m][source] += entry_total
-
-    return aggregated, source_totals
-
-
-# ---------------------------------------------------------------------------
-# Pricing Engine
-# ---------------------------------------------------------------------------
-
-REPO_PRICING_URL = "https://raw.githubusercontent.com/gigaprakosa/antigravity-usage/main/pricing.json"
 LITELLM_PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
-CACHE_FILE = Path.home() / ".gemini/antigravity-usage-pricing.json"
-CACHE_TTL = 86400  # 24 hours
-
-# Hardcoded defaults — May 2026 pricing
-DEFAULT_PRICING = {
-    "models": {
-        "gemini-3.1-flash": {"input": 0.50, "output": 3.00},
-        "gemini-3.1-flash-lite": {"input": 0.25, "output": 1.50},
-        "gemini-3.1-pro": {"input": 2.00, "output": 12.00},
-        "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
-        "gemini-2.5-pro": {"input": 1.25, "output": 10.00},
-        "claude-opus-4": {"input": 15.00, "output": 75.00},
-        "claude-sonnet-4": {"input": 3.00, "output": 15.00},
-    },
-    "rules": {
-        "cache_read_factor": 0.10,
-        "thought_billed_as": "output",
-    },
-}
-
-# Providers to extract from LiteLLM
-LITELLM_PROVIDER_PREFIXES = ("gemini", "claude", "anthropic")
 
 
-def fetch_json(url):
-    """Fetch JSON from a URL with a 5-second timeout."""
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+def http_post(url, data, headers, timeout=25):
+    """POST and return (status, body_text). Never raises."""
+    req = urllib.request.Request(url, data=data, headers=headers)
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
-            return json.loads(response.read().decode())
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+    except Exception as e:
+        return None, str(e)
+
+
+def http_get_json(url, timeout=30):
+    """GET and parse JSON, or return None on any failure."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read().decode())
     except Exception:
         return None
 
 
-def load_pricing():
-    """Load pricing data with tiered fallback: cache → LiteLLM → repo → defaults."""
+# ---------------------------------------------------------------------------
+# Minimal protobuf field reader (length-delimited string fields only)
+# ---------------------------------------------------------------------------
 
-    # 1. Try valid cache
-    if CACHE_FILE.exists():
-        if time.time() - CACHE_FILE.stat().st_mtime < CACHE_TTL:
+def _read_varint(buf, i):
+    val = shift = 0
+    while True:
+        b = buf[i]
+        val |= (b & 0x7F) << shift
+        i += 1
+        if not b & 0x80:
+            return val, i
+        shift += 7
+
+
+def proto_string_fields(buf):
+    """Yield (field_number, bytes) for wire-type-2 fields in a protobuf message."""
+    i, n = 0, len(buf)
+    while i < n:
+        tag, i = _read_varint(buf, i)
+        field_num, wire = tag >> 3, tag & 0x07
+        if wire == 2:  # length-delimited
+            length, i = _read_varint(buf, i)
+            yield field_num, buf[i:i + length]
+            i += length
+        elif wire == 0:  # varint
+            _, i = _read_varint(buf, i)
+        elif wire == 5:  # 32-bit
+            i += 4
+        elif wire == 1:  # 64-bit
+            i += 8
+        else:
+            break
+
+
+# ---------------------------------------------------------------------------
+# Auth — mint a Bearer access token for the user's Antigravity account
+# ---------------------------------------------------------------------------
+
+class AntigravityAuth:
+    """Resolves a valid OAuth Bearer token for CloudCode calls.
+
+    Order of preference:
+      1. Cached non-expired token from a previous run.
+      2. Refresh token embedded in the Antigravity IDE state DB.
+      3. Refresh token in the agy CLI's oauth_creds.json.
+    """
+
+    def __init__(self):
+        self._clients = self._discover_oauth_clients()
+
+    @staticmethod
+    def _discover_oauth_clients():
+        """Return candidate (id, secret) OAuth client pairs.
+
+        Client id/secret are pulled from the public agy binary (required to use
+        Antigravity at all); their pairing is ambiguous (multiple ids/secrets,
+        adjacent in memory), so every id × secret combination is offered and the
+        correct pair self-selects at refresh time. Nothing is hardcoded — no
+        credential ships in this source.
+        """
+        pairs = []
+        try:
+            blob = AGY_BINARY.read_bytes()
+            ids = [m.decode() for m in dict.fromkeys(
+                re.findall(rb"[0-9]{10,}-[a-z0-9]+\.apps\.googleusercontent\.com", blob))]
+            # Secrets are exactly "GOCSPX-" + 28 chars; anchor the length to avoid
+            # greedily spanning two adjacent secrets.
+            secrets = [m.decode() for m in dict.fromkeys(
+                re.findall(rb"GOCSPX-[A-Za-z0-9_\-]{28}", blob))]
+            for cid in ids:
+                for secret in secrets:
+                    if (cid, secret) not in pairs:
+                        pairs.append((cid, secret))
+        except Exception:
+            pass
+        return pairs
+
+    def _ide_refresh_token(self):
+        if not IDE_STATE_DB.exists():
+            return None
+        try:
+            con = sqlite3.connect(f"file:{IDE_STATE_DB}?mode=ro", uri=True)
+            row = con.execute(
+                "SELECT value FROM ItemTable WHERE key LIKE '%oauthToken%'"
+            ).fetchone()
+            con.close()
+        except Exception:
+            return None
+        if not row:
+            return None
+        raw = row[0].decode(errors="ignore") if isinstance(row[0], bytes) else row[0]
+        try:
+            outer = base64.b64decode(raw.strip().strip('"') + "==").decode("latin1")
+            after = outer[re.search("oauthTokenInfoSentinelKey", outer).end():]
+            inner_b64 = re.findall(r"[A-Za-z0-9+/_\-]{80,}={0,2}", after)[0]
+            inner = base64.b64decode(inner_b64 + "==")
+            for field_num, value in proto_string_fields(inner):
+                if field_num == 3:  # refresh_token
+                    return value.decode("latin1")
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _agy_refresh_token():
+        try:
+            return json.loads(AGY_OAUTH_CREDS.read_text()).get("refresh_token")
+        except Exception:
+            return None
+
+    def _refresh(self, refresh_token):
+        """Try each candidate client pair until one mints a token."""
+        for cid, secret in self._clients:
+            body = urllib.parse.urlencode({
+                "client_id": cid,
+                "client_secret": secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            }).encode()
+            status, text = http_post(
+                OAUTH_TOKEN_URL, body,
+                {"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            if status == 200:
+                data = json.loads(text)
+                return data["access_token"], time.time() + data.get("expires_in", 3000)
+        return None, 0
+
+    def access_token(self):
+        """Return a valid Bearer token, or None if the user must re-auth in Antigravity."""
+        if TOKEN_CACHE.exists():
             try:
-                with open(CACHE_FILE, 'r') as f:
-                    return json.load(f)
+                cached = json.loads(TOKEN_CACHE.read_text())
+                if cached.get("expiry", 0) - 60 > time.time():
+                    return cached["token"]
             except Exception:
                 pass
 
-    # Initialize with default pricing
-    pricing = {
-        "models": dict(DEFAULT_PRICING["models"]),
-        "rules": dict(DEFAULT_PRICING["rules"])
+        for refresh in (self._ide_refresh_token(), self._agy_refresh_token()):
+            if not refresh:
+                continue
+            token, expiry = self._refresh(refresh)
+            if token:
+                try:
+                    TOKEN_CACHE.write_text(json.dumps({"token": token, "expiry": expiry}))
+                    TOKEN_CACHE.chmod(0o600)  # bearer token — owner-only
+                except Exception:
+                    pass
+                return token
+        return None
+
+
+# ---------------------------------------------------------------------------
+# CloudCode API client — live tier + quota
+# ---------------------------------------------------------------------------
+
+class CloudCodeClient:
+    def __init__(self, token):
+        self._headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+    def _call(self, verb, body):
+        status, text = http_post(
+            f"{CLOUDCODE_HOST}/{verb}", json.dumps(body).encode(), self._headers
+        )
+        if status == 200:
+            try:
+                return json.loads(text)
+            except Exception:
+                return None
+        return None
+
+    def tier(self):
+        """Return (tier_name, account_email) or (None, None)."""
+        data = self._call("v1internal:loadCodeAssist", {"metadata": {"pluginType": "GEMINI"}})
+        if not data:
+            return None, None
+        tier = (data.get("paidTier") or data.get("currentTier") or {}).get("name")
+        email = None
+        m = re.search(r"Email=([^&]+)", data.get("manageSubscriptionUri", ""))
+        if m:
+            email = urllib.parse.unquote(m.group(1))
+        return tier, email
+
+    def quota(self):
+        """Return list of quota buckets: [{modelId, tokenType, remainingFraction, resetTime}]."""
+        data = self._call("v1internal:retrieveUserQuota", {})
+        return data.get("buckets", []) if data else []
+
+
+# ---------------------------------------------------------------------------
+# Pricing engine — live online every run, last-good cache fallback
+# ---------------------------------------------------------------------------
+
+class PricingEngine:
+    """Per-million-token input/output rates fetched live from LiteLLM.
+
+    On fetch failure, falls back to the last successful cache (flagged stale).
+    No static pricing is bundled — every price shown comes from real online data.
+    """
+
+    PROVIDER_HINTS = ("gemini", "claude", "anthropic")
+
+    def __init__(self):
+        self.models, self.as_of, self.stale = self._load()
+
+    def _load(self):
+        raw = http_get_json(LITELLM_PRICING_URL)
+        if raw:
+            models = {}
+            for key, val in raw.items():
+                kl = key.lower()
+                if not any(h in kl for h in self.PROVIDER_HINTS):
+                    continue
+                ic = val.get("input_cost_per_token")
+                oc = val.get("output_cost_per_token")
+                if ic:
+                    models[key.split("/")[-1]] = {
+                        "input": ic * 1_000_000,
+                        "output": (oc or 0) * 1_000_000,
+                    }
+            if models:
+                as_of = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                try:
+                    PRICING_CACHE.write_text(json.dumps({"models": models, "as_of": as_of}))
+                except Exception:
+                    pass
+                return models, as_of, False
+        # Fallback: last successful fetch
+        if PRICING_CACHE.exists():
+            try:
+                c = json.loads(PRICING_CACHE.read_text())
+                return c["models"], c.get("as_of", "unknown"), True
+            except Exception:
+                pass
+        return {}, None, True
+
+    def rate(self, model):
+        """Return {'input','output'} for a model via exact then fuzzy match, or None."""
+        if not self.models:
+            return None
+        m = model.lower()
+        if m in self.models:
+            return self.models[m]
+        for key in sorted(self.models, key=len, reverse=True):
+            kl = key.lower()
+            if kl in m or m in kl:
+                return self.models[key]
+        return None
+
+    def cost(self, model, input_tokens, output_tokens, cached_tokens=0):
+        """Estimate USD cost. Cached input billed at 10% (standard read discount)."""
+        r = self.rate(model)
+        if not r:
+            return None
+        billable_in = max(input_tokens - cached_tokens, 0)
+        return (
+            billable_in / 1_000_000 * r["input"]
+            + cached_tokens / 1_000_000 * r["input"] * 0.10
+            + output_tokens / 1_000_000 * r["output"]
+        )
+
+
+# ---------------------------------------------------------------------------
+# Usage ledger — forward-captured per-turn tokens (written by the agy hook)
+# ---------------------------------------------------------------------------
+
+class UsageLedger:
+    """Reads the JSONL ledger appended by the Antigravity Stop hook.
+
+    Each line: {"ts": ISO8601, "model": str, "input": int, "output": int, "cached": int}
+    """
+
+    def __init__(self, path=LEDGER_FILE):
+        self.path = Path(path)
+
+    def by_month_model(self):
+        """Return month -> model -> {'input','output','cached','total'}.
+
+        `input` is the full prompt size and `cached` is the subset of it served
+        from cache (matching cost()'s `input - cached` billing), so the token
+        total is input + output — adding cached again would double-count it.
+        """
+        agg = defaultdict(lambda: defaultdict(lambda: {
+            "input": 0, "output": 0, "cached": 0, "total": 0
+        }))
+        if not self.path.exists():
+            return agg
+        for line in self.path.read_text(errors="ignore").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            month = (e.get("ts") or "")[:7] or "unknown"
+            model = e.get("model", "unknown")
+            cell = agg[month][model]
+            for k in ("input", "output", "cached"):
+                cell[k] += int(e.get(k, 0) or 0)
+            cell["total"] += sum(int(e.get(k, 0) or 0) for k in ("input", "output"))
+        return agg
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+class Renderer:
+    def __init__(self, pricing):
+        self.pricing = pricing
+
+    def live(self, tier, email, buckets):
+        print("🛰️  Antigravity — Live Account")
+        who = f" ({email})" if email else ""
+        print(f"• Plan: {tier or 'unknown'}{who}")
+        if not buckets:
+            print("• Quota: unavailable")
+            return
+        print("• Quota remaining (resets per window):")
+        for b in sorted(buckets, key=lambda x: x.get("modelId", "")):
+            frac = b.get("remainingFraction", 0)
+            bar = self._bar(frac)
+            reset = (b.get("resetTime", "") or "")[:16].replace("T", " ")
+            print(f"    {b.get('modelId','?'):28} {bar} {frac*100:5.1f}%  ({b.get('tokenType','')}, reset {reset})")
+
+    @staticmethod
+    def _bar(frac, width=12):
+        filled = int(round(frac * width))
+        return "[" + "█" * filled + "·" * (width - filled) + "]"
+
+    def history(self, agg):
+        months = sorted(agg.keys())
+        if not months:
+            print("\n📊 Captured token history: none yet.")
+            print("   Run `antigravity-usage --install-hook` to record usage going forward.")
+            return
+        if self.pricing.stale:
+            print(f"\n⚠️  Pricing is stale (last fetched {self.pricing.as_of}); live source unreachable.")
+        print(f"\n📊 Captured token usage ({len(months)} month(s)), priced live:")
+        for month in months:
+            tokens = cost = 0
+            missing = False
+            for model, s in agg[month].items():
+                tokens += s["total"]
+                c = self.pricing.cost(model, s["input"], s["output"], s["cached"])
+                if c is None:
+                    missing = True
+                else:
+                    cost += c
+            flag = " (some models unpriced)" if missing else ""
+            print(f"• {month}: {tokens:,} tokens, Cost: ${cost:.2f}{flag}")
+
+
+# ---------------------------------------------------------------------------
+# Hook installation (forward-capture)
+# ---------------------------------------------------------------------------
+
+HOOK_PLUGIN_DIR = HOME / ".gemini/antigravity-cli/plugins/antigravity-usage"
+
+
+def install_hook():
+    """Install an Antigravity Stop hook that records per-turn token usage."""
+    hooks_dir = HOOK_PLUGIN_DIR / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    recorder = hooks_dir / "record-usage.py"
+    recorder.write_text(_RECORDER_SOURCE)
+    recorder.chmod(0o755)
+    hooks_json = HOOK_PLUGIN_DIR / "hooks.json"
+    hooks_json.write_text(json.dumps({
+        "hooks": {
+            "Stop": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": f"python3 \"{recorder}\"",
+                    "async": True,
+                }],
+            }],
+        }
+    }, indent=2))
+    print(f"✅ Installed Antigravity usage hook → {hooks_json}")
+    print(f"   Recorder: {recorder}")
+    print(f"   Ledger:   {LEDGER_FILE}")
+    print("   New token usage will be captured after your next Antigravity turn.")
+
+
+# Source for the hook recorder. Reads the hook JSON payload from stdin and
+# appends a normalized usage line to the ledger. Defensive: tolerates unknown
+# payload shapes by scanning for usage/token fields.
+_RECORDER_SOURCE = r'''#!/usr/bin/env python3
+"""Antigravity Stop hook — append per-turn token usage to the ledger."""
+import json, sys, time, os
+
+LEDGER = os.path.expanduser("~/.gemini/antigravity-cli/usage-ledger.jsonl")
+
+
+def find_usage(obj):
+    """Return (model, input, output, cached) discovered anywhere in the payload.
+
+    Canonical contract: `input` is the FULL prompt size (including cached
+    tokens) and `cached` is the read-discounted subset of it. Providers differ
+    on whether cache reads are already inside their prompt count:
+      - Gemini `cachedContentTokenCount`     ⊂ promptTokenCount  (already in input)
+      - OpenAI `cached_tokens`               ⊂ prompt_tokens     (already in input)
+      - Anthropic `cache_read_input_tokens`  ✗ NOT in input_tokens (must be added)
+    So cache-read fields that sit outside the prompt count are folded into
+    `input`, making `input - cached` a correct billable figure for every
+    provider. (Anthropic `cache_creation_input_tokens` is billed at a premium,
+    not a discount, and is out of scope here.)
+    """
+    model = None
+    toks = {"input": 0, "output": 0, "cached_in_input": 0, "cached_separate": 0}
+    key_map = {
+        "input": ("input", "inputtokens", "input_tokens", "prompttokencount", "prompttokens"),
+        "output": ("output", "outputtokens", "output_tokens", "candidatestokencount", "completiontokens"),
+        # Cache reads already counted inside the prompt/input figure:
+        "cached_in_input": ("cached", "cachedcontenttokencount", "cached_tokens"),
+        # Cache reads reported separately from input (Anthropic, snake + camel):
+        "cached_separate": ("cache_read_input_tokens", "cachereadinputtokens"),
     }
 
-    # 2. Try fetching from LiteLLM (community standard)
-    community_data = fetch_json(LITELLM_PRICING_URL)
-    if community_data:
-        for key, val in community_data.items():
-            key_lower = key.lower()
-            if any(p in key_lower for p in LITELLM_PROVIDER_PREFIXES):
-                input_cost = val.get("input_cost_per_token", 0) * 1_000_000
-                output_cost = val.get("output_cost_per_token", 0) * 1_000_000
-                if input_cost > 0:
-                    clean_key = key.split("/")[-1]
-                    pricing["models"][clean_key] = {
-                        "input": input_cost,
-                        "output": output_cost,
-                    }
+    def walk(o):
+        nonlocal model
+        if isinstance(o, dict):
+            for k, v in o.items():
+                kl = str(k).lower()
+                if kl in ("model", "modelid", "modelversion") and isinstance(v, str) and not model:
+                    model = v
+                if isinstance(v, (int, float)):
+                    for dest, names in key_map.items():
+                        if kl in names:
+                            toks[dest] += int(v)
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
 
-    # 3. Try fetching from repo (curated overrides)
-    repo_data = fetch_json(REPO_PRICING_URL)
-    if repo_data:
-        if "models" in repo_data:
-            pricing["models"].update(repo_data["models"])
-        if "rules" in repo_data:
-            pricing["rules"].update(repo_data["rules"])
+    walk(obj)
+    input_full = toks["input"] + toks["cached_separate"]
+    cached = toks["cached_in_input"] + toks["cached_separate"]
+    return model, input_full, toks["output"], cached
 
-    # 4. Fallback to expired cache if fetching failed completely
-    if not community_data and not repo_data and CACHE_FILE.exists():
-        try:
-            with open(CACHE_FILE, 'r') as f:
-                return json.load(f)
-        except Exception:
-            pass
 
-    # Save to cache
+def main():
     try:
-        os.makedirs(CACHE_FILE.parent, exist_ok=True)
-        with open(CACHE_FILE, 'w') as f:
-            json.dump(pricing, f)
+        payload = json.load(sys.stdin)
     except Exception:
-        pass
-
-    return pricing
-
-
-# Global pricing data
-PRICING_DATA = load_pricing()
-
-
-def get_pricing_for_model(model_name):
-    """Look up pricing for a model with fuzzy matching."""
-    model_name = model_name.lower()
-    models = PRICING_DATA.get("models", {})
-
-    # Try exact match
-    if model_name in models:
-        return models[model_name]
-
-    # Try fuzzy match (e.g., "gemini-3.1-pro-preview" → "gemini-3.1-pro")
-    for key in sorted(models.keys(), key=len, reverse=True):
-        if key in model_name or model_name in key:
-            return models[key]
-
-    # Fallback to standard Flash pricing
-    return models.get(
-        "gemini-3.1-flash",
-        DEFAULT_PRICING["models"]["gemini-3.1-flash"],
-    )
-
-
-def calculate_cost(model_name, stats):
-    """Calculate estimated cost for a model's aggregated stats."""
-    pricing = get_pricing_for_model(model_name)
-    rules = PRICING_DATA.get("rules", DEFAULT_PRICING["rules"])
-
-    # Tool tokens are input tokens (tool results sent back to the model)
-    input_total = stats['input'] + stats.get('tool', 0)
-    input_cost = (input_total / 1_000_000) * pricing["input"]
-
-    cache_factor = rules.get("cache_read_factor", 0.10)
-    cache_read_cost = (stats['cached'] / 1_000_000) * (pricing["input"] * cache_factor)
-
-    thought_billing = rules.get("thought_billed_as", "output")
-    thought_rate = pricing.get(thought_billing, pricing["output"])
-    thought_cost = (stats['thoughts'] / 1_000_000) * thought_rate
-
-    output_rate = pricing["output"]
-    output_cost = (stats['output'] / 1_000_000) * output_rate
-
-    return input_cost + cache_read_cost + thought_cost + output_cost
-
-
-# ---------------------------------------------------------------------------
-# Output
-# ---------------------------------------------------------------------------
-
-def print_table(aggregated, source_totals):
-    """Print the usage summary table."""
-    months = sorted(aggregated.keys())
-
-    if not months:
-        print("No usage data found.")
         return
+    model, inp, out, cached = find_usage(payload)
+    if not (inp or out or cached):
+        return  # nothing to record
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "model": model or payload.get("model", "unknown"),
+        "input": inp, "output": out, "cached": cached,
+        "session_id": payload.get("session_id"),
+    }
+    os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+    with open(LEDGER, "a") as f:
+        f.write(json.dumps(entry) + "\n")
 
-    if len(months) == 1:
-        print("📊 Antigravity Usage:")
-    else:
-        print(f"📊 Antigravity Usage (last {len(months)} months):")
 
-    for month in months:
-        monthly_total_tokens = 0
-        monthly_total_cost = 0.0
-
-        for model_name, stats in aggregated[month].items():
-            monthly_total_tokens += stats['total']
-            monthly_total_cost += calculate_cost(model_name, stats)
-
-        print(f"• {month}: {monthly_total_tokens:,} tokens, Cost: ${monthly_total_cost:.2f}")
+if __name__ == "__main__":
+    main()
+'''
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+def main():
+    parser = argparse.ArgumentParser(
+        description="Live quota + token-cost tracker for Google Antigravity."
+    )
+    parser.add_argument(
+        "--install-hook", action="store_true",
+        help="Install the Antigravity Stop hook that records token usage going forward.",
+    )
+    parser.add_argument(
+        "--no-live", action="store_true",
+        help="Skip the live CloudCode account/quota lookup (history only).",
+    )
+    args = parser.parse_args()
+
+    if args.install_hook:
+        install_hook()
+        return
+
+    pricing = PricingEngine()
+    renderer = Renderer(pricing)
+
+    if not args.no_live:
+        token = AntigravityAuth().access_token()
+        if token:
+            client = CloudCodeClient(token)
+            tier, email = client.tier()
+            renderer.live(tier, email, client.quota())
+        else:
+            print("🛰️  Antigravity — Live Account")
+            print("• Unavailable: no valid credentials. Sign in via the Antigravity app/CLI, then retry.")
+
+    renderer.history(UsageLedger().by_month_model())
+
+
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Antigravity Usage — Unified CLI/IDE token usage and cost tracker.")
-    parser.parse_args()
-
-    all_usage = []
-    for collector in COLLECTORS:
-        all_usage.extend(collector.collect())
-
-    if not all_usage:
-        print("No usage data found.")
-    else:
-        agg, src_totals = aggregate_usage(all_usage)
-        print_table(agg, src_totals)
+    main()
