@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
-"""Antigravity Usage — live quota + token-cost tracker for Google Antigravity.
+"""Antigravity Usage — live quota + conversation activity for Google Antigravity.
 
 Scope: Google Antigravity only (CLI + IDE). The legacy Gemini CLI is deprecated
 (EOL 2026-06-18) and is intentionally NOT a data source here.
 
-Antigravity does not persist historical token usage in any readable form (the
-local conversation store is encrypted; per-response UsageMetadata is discarded).
-This tool therefore reports usage from the two sources that ARE authoritative:
+This tool reports usage from the two sources that ARE authoritative and
+client-readable:
 
   1. Live account state — Google CloudCode API (tier + per-model quota remaining).
-  2. Forward-captured tokens — a local ledger written by an Antigravity `Stop`
-     hook (install with `antigravity-usage --install-hook`), priced with live
-     online rates (LiteLLM) every run. No bundled pricing.json.
+  2. Conversation activity — Antigravity's own local SQLite stores
+     (~/.gemini/antigravity-cli/conversations/*.db and the antigravity/ sibling),
+     aggregated into per-month conversation counts, assistant turns, and the
+   model mix actually used.
+
+What this tool deliberately does NOT do: estimate USD cost. Antigravity is
+billed as a flat-rate subscription, so Google does not persist per-token
+usage metadata in any client-readable form (transcripts discard
+UsageMetadata; the conversation SQLite stores carry step content but no
+token counts; retrieveUserQuota returns only REQUEST-type quota, not
+tokens; retrieveUserQuotaSummary is 403 for normal accounts). Any "cost"
+number would be fabricated, so we show none.
 
 Design (SOLID): each concern is an isolated unit —
   AntigravityAuth     → mint a Bearer from the IDE-stored refresh token
   CloudCodeClient     → call loadCodeAssist / retrieveUserQuota
-  PricingEngine       → live online pricing with last-good cache fallback
-  UsageLedger         → read + aggregate the hook-written token ledger
+  ConversationStore   → read + aggregate Antigravity's conversation DBs
   Renderer            → format output
 """
 
@@ -33,20 +40,36 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import defaultdict
+from collections import defaultdict, Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 HOME = Path.home()
 CLOUDCODE_HOST = "https://cloudcode-pa.googleapis.com"
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
-IDE_STATE_DB = HOME / "Library/Application Support/Antigravity/User/globalStorage/state.vscdb"
-AGY_OAUTH_CREDS = HOME / ".gemini/oauth_creds.json"
-AGY_BINARY = HOME / ".local/bin/agy"
-LEDGER_FILE = HOME / ".gemini/antigravity-cli/usage-ledger.jsonl"
-TOKEN_CACHE = HOME / ".gemini/antigravity-usage-token.json"
-PRICING_CACHE = HOME / ".gemini/antigravity-usage-pricing-cache.json"
 
-LITELLM_PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+# OAuth client pair source. The pair ships inside the publicly distributed
+# `agy` binary (and the Antigravity.app bundle); we extract it at runtime
+# rather than hardcoding, so this source carries no credentials and survives
+# Google rotating the pair. Cached after first successful refresh.
+AGY_BINARY = HOME / ".local/bin/agy"
+OAUTH_CLIENT_CACHE = HOME / ".gemini/antigravity-usage-oauth-client.json"
+
+# Auth sources (probed in order).
+IDE_STATE_DBS = [
+    HOME / "Library/Application Support/Antigravity/User/globalStorage/state.vscdb",
+]
+AGY_OAUTH_CREDS = HOME / ".gemini/oauth_creds.json"
+
+# Conversation stores. Antigravity CLI writes under antigravity-cli/; the
+# Antigravity 2.0 IDE uses antigravity/ with the same SQLite schema.
+CONVERSATION_DIRS = [
+    HOME / ".gemini/antigravity-cli/conversations",
+    HOME / ".gemini/antigravity/conversations",
+]
+
+# Per-run caches (owner-only).
+TOKEN_CACHE = HOME / ".gemini/antigravity-usage-token.json"
 
 
 # ---------------------------------------------------------------------------
@@ -65,17 +88,8 @@ def http_post(url, data, headers, timeout=25):
         return None, str(e)
 
 
-def http_get_json(url, timeout=30):
-    """GET and parse JSON, or return None on any failure."""
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            return json.loads(r.read().decode())
-    except Exception:
-        return None
-
-
 # ---------------------------------------------------------------------------
-# Minimal protobuf field reader (length-delimited string fields only)
+# Minimal protobuf field reader (length-delimited + varint fields)
 # ---------------------------------------------------------------------------
 
 def _read_varint(buf, i):
@@ -89,24 +103,35 @@ def _read_varint(buf, i):
         shift += 7
 
 
-def proto_string_fields(buf):
-    """Yield (field_number, bytes) for wire-type-2 fields in a protobuf message."""
+def proto_fields(buf):
+    """Yield (field_number, wire_type, raw_value) for every top-level field.
+
+    wire_type: 0 = varint, 2 = length-delimited bytes.
+    """
     i, n = 0, len(buf)
     while i < n:
         tag, i = _read_varint(buf, i)
         field_num, wire = tag >> 3, tag & 0x07
-        if wire == 2:  # length-delimited
+        if wire == 0:  # varint
+            val, i = _read_varint(buf, i)
+            yield field_num, 0, val
+        elif wire == 2:  # length-delimited
             length, i = _read_varint(buf, i)
-            yield field_num, buf[i:i + length]
+            yield field_num, 2, buf[i:i + length]
             i += length
-        elif wire == 0:  # varint
-            _, i = _read_varint(buf, i)
         elif wire == 5:  # 32-bit
             i += 4
         elif wire == 1:  # 64-bit
             i += 8
         else:
             break
+
+
+def proto_string_fields(buf):
+    """Back-compat shim: yield (field_number, bytes) for wire-type-2 fields."""
+    for fn, wire, val in proto_fields(buf):
+        if wire == 2:
+            yield fn, val
 
 
 # ---------------------------------------------------------------------------
@@ -118,64 +143,154 @@ class AntigravityAuth:
 
     Order of preference:
       1. Cached non-expired token from a previous run.
-      2. Refresh token embedded in the Antigravity IDE state DB.
+      2. Refresh token embedded in the Antigravity IDE state DB
+         (antigravityUnifiedStateSync.oauthToken key, double-base64 envelope
+         containing an OAuthTokenInfo protobuf with refresh_token at field 3).
       3. Refresh token in the agy CLI's oauth_creds.json.
+
+    The OAuth client_id/secret used to refresh is NOT hardcoded — it's scanned
+    from the public agy binary on first run, then cached. Nothing ships in
+    this source.
     """
 
-    def __init__(self):
-        self._clients = self._discover_oauth_clients()
+    def access_token(self):
+        """Return a valid Bearer token, or None if the user must re-auth."""
+        cached = self._cached_token()
+        if cached:
+            return cached
+
+        for refresh in (self._ide_refresh_token(), self._agy_refresh_token()):
+            if not refresh:
+                continue
+            token, expiry = self._refresh(refresh)
+            if token:
+                self._cache_token(token, expiry)
+                return token
+        return None
+
+    # --- cache -------------------------------------------------------------
 
     @staticmethod
-    def _discover_oauth_clients():
-        """Return candidate (id, secret) OAuth client pairs.
-
-        Client id/secret are pulled from the public agy binary (required to use
-        Antigravity at all); their pairing is ambiguous (multiple ids/secrets,
-        adjacent in memory), so every id × secret combination is offered and the
-        correct pair self-selects at refresh time. Nothing is hardcoded — no
-        credential ships in this source.
-        """
-        pairs = []
+    def _cached_token():
+        if not TOKEN_CACHE.exists():
+            return None
         try:
-            blob = AGY_BINARY.read_bytes()
-            ids = [m.decode() for m in dict.fromkeys(
-                re.findall(rb"[0-9]{10,}-[a-z0-9]+\.apps\.googleusercontent\.com", blob))]
-            # Secrets are exactly "GOCSPX-" + 28 chars; anchor the length to avoid
-            # greedily spanning two adjacent secrets.
-            secrets = [m.decode() for m in dict.fromkeys(
-                re.findall(rb"GOCSPX-[A-Za-z0-9_\-]{28}", blob))]
-            for cid in ids:
-                for secret in secrets:
-                    if (cid, secret) not in pairs:
-                        pairs.append((cid, secret))
+            cached = json.loads(TOKEN_CACHE.read_text())
+            if cached.get("expiry", 0) - 60 > time.time():
+                return cached["token"]
         except Exception:
             pass
-        return pairs
+        return None
+
+    @staticmethod
+    def _cache_token(token, expiry):
+        try:
+            TOKEN_CACHE.write_text(json.dumps({"token": token, "expiry": expiry}))
+            TOKEN_CACHE.chmod(0o600)  # bearer token — owner-only
+        except Exception:
+            pass
+
+    # --- refresh-token sources --------------------------------------------
 
     def _ide_refresh_token(self):
-        if not IDE_STATE_DB.exists():
+        """Walk the documented nested-protobuf envelope to field 3 (refresh).
+
+        Decode chain (verified against community fixtures in
+        Draculabo/AntigravityManager and abuhanna/winusage):
+
+            value (b64) → wrapper proto
+              wrapper.field 1 → inner proto
+                inner.field 1 = sentinel string "oauthTokenInfoSentinelKey"
+                inner.field 2 = payload proto
+                  payload.field 1 = utf-8 base64 string
+                    b64-decode → OAuthTokenInfo proto
+                      OAuthTokenInfo.field 3 = refresh_token (string)
+        """
+        for db_path in IDE_STATE_DBS:
+            if not db_path.exists():
+                continue
+            try:
+                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                row = con.execute(
+                    "SELECT value FROM ItemTable WHERE key LIKE '%oauthToken%' "
+                    "ORDER BY LENGTH(value) DESC LIMIT 1"
+                ).fetchone()
+                con.close()
+            except Exception:
+                continue
+            if not row:
+                continue
+            token = self._extract_refresh_from_envelope(row[0])
+            if token:
+                return token
+        return None
+
+    @staticmethod
+    def _extract_refresh_from_envelope(raw):
+        """Decode the antigravityUnifiedStateSync.oauthToken envelope.
+
+        The wrapper proto carries multiple field-1 sections, each keyed by a
+        sentinel string in inner.field 1. We want the one whose sentinel is
+        "oauthTokenInfoSentinelKey". Inside that section:
+
+            inner.field 2 = payload proto
+              payload.field 1 = utf-8 base64 string
+                b64-decode → OAuthTokenInfo proto
+                  OAuthTokenInfo.field 3 = refresh_token (string)
+        """
+        if raw is None:
             return None
+        if isinstance(raw, bytes):
+            try:
+                raw = raw.decode("utf-8", errors="ignore")
+            except Exception:
+                return None
+        raw = raw.strip().strip('"')
         try:
-            con = sqlite3.connect(f"file:{IDE_STATE_DB}?mode=ro", uri=True)
-            row = con.execute(
-                "SELECT value FROM ItemTable WHERE key LIKE '%oauthToken%'"
-            ).fetchone()
-            con.close()
+            wrapper = base64.b64decode(raw + "==")
         except Exception:
             return None
-        if not row:
+
+        # Find the field-1 section whose inner.field 1 is the OAuth sentinel.
+        payload = None
+        for fn, wire, val in proto_fields(wrapper):
+            if fn != 1 or wire != 2:
+                continue
+            sentinel = None
+            section_payload = None
+            for sfn, swire, sval in proto_fields(val):
+                if sfn == 1 and swire == 2:
+                    try:
+                        sentinel = sval.decode("utf-8")
+                    except Exception:
+                        pass
+                elif sfn == 2 and swire == 2:
+                    section_payload = sval
+            if sentinel == "oauthTokenInfoSentinelKey" and section_payload is not None:
+                payload = section_payload
+                break
+        if payload is None:
             return None
-        raw = row[0].decode(errors="ignore") if isinstance(row[0], bytes) else row[0]
+
+        # payload.field 1 is a utf-8 base64 string of OAuthTokenInfo.
+        oauth_b64 = None
+        for fn, wire, val in proto_fields(payload):
+            if fn == 1 and wire == 2:
+                oauth_b64 = val
+                break
+        if oauth_b64 is None:
+            return None
         try:
-            outer = base64.b64decode(raw.strip().strip('"') + "==").decode("latin1")
-            after = outer[re.search("oauthTokenInfoSentinelKey", outer).end():]
-            inner_b64 = re.findall(r"[A-Za-z0-9+/_\-]{80,}={0,2}", after)[0]
-            inner = base64.b64decode(inner_b64 + "==")
-            for field_num, value in proto_string_fields(inner):
-                if field_num == 3:  # refresh_token
-                    return value.decode("latin1")
+            oauth_info = base64.b64decode(oauth_b64.decode("utf-8") + "==")
         except Exception:
             return None
+        # OAuthTokenInfo.field 3 = refresh_token.
+        for fn, wire, val in proto_fields(oauth_info):
+            if fn == 3 and wire == 2:
+                try:
+                    return val.decode("utf-8")
+                except Exception:
+                    return val.decode("latin1")
         return None
 
     @staticmethod
@@ -185,9 +300,75 @@ class AntigravityAuth:
         except Exception:
             return None
 
+    # --- OAuth client pair (extracted from agy, cached) -------------------
+
+    def _oauth_client_pairs(self):
+        """Return list of (client_id, client_secret) candidates.
+
+        The pair ships inside the publicly distributed agy binary; we extract
+        it at runtime so this source carries no credentials and survives Google
+        rotating the pair. After the first successful refresh the working pair
+        is cached and reused, so subsequent runs skip the 142MB binary scan.
+        """
+        cached = self._load_cached_client_pair()
+        if cached:
+            return [cached]
+        return self._discover_client_pairs()
+
+    @staticmethod
+    def _load_cached_client_pair():
+        if not OAUTH_CLIENT_CACHE.exists():
+            return None
+        try:
+            d = json.loads(OAUTH_CLIENT_CACHE.read_text())
+            pair = d.get("pair")
+            if pair and len(pair) == 2:
+                return (pair[0], pair[1])
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _cache_client_pair(cid, secret):
+        try:
+            OAUTH_CLIENT_CACHE.write_text(json.dumps({"pair": [cid, secret]}))
+            OAUTH_CLIENT_CACHE.chmod(0o600)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _discover_client_pairs():
+        """Scan the public agy binary for Google OAuth client id + secret pairs.
+
+        Multiple ids and secrets sit adjacent in the binary; their pairing is
+        ambiguous from regex alone, so every id × secret combination is offered
+        and the correct pair self-selects at refresh time.
+        """
+        if not AGY_BINARY.exists():
+            return []
+        try:
+            blob = AGY_BINARY.read_bytes()
+        except Exception:
+            return []
+        ids = list(dict.fromkeys(
+            m.decode() for m in re.findall(
+                rb"[0-9]{10,}-[a-z0-9]+\.apps\.googleusercontent\.com", blob
+            )
+        ))
+        # Secrets are exactly "GOCSPX-" + 28 chars; anchor the length so two
+        # adjacent secrets don't get greedily spanned.
+        secrets = list(dict.fromkeys(
+            m.decode() for m in re.findall(
+                rb"GOCSPX-[A-Za-z0-9_\-]{28}", blob
+            )
+        ))
+        return [(cid, secret) for cid in ids for secret in secrets]
+
+    # --- refresh against Google OAuth -------------------------------------
+
     def _refresh(self, refresh_token):
-        """Try each candidate client pair until one mints a token."""
-        for cid, secret in self._clients:
+        """Try each candidate pair until one mints a token. Cache the winner."""
+        for cid, secret in self._oauth_client_pairs():
             body = urllib.parse.urlencode({
                 "client_id": cid,
                 "client_secret": secret,
@@ -199,32 +380,10 @@ class AntigravityAuth:
                 {"Content-Type": "application/x-www-form-urlencoded"},
             )
             if status == 200:
+                self._cache_client_pair(cid, secret)
                 data = json.loads(text)
                 return data["access_token"], time.time() + data.get("expires_in", 3000)
         return None, 0
-
-    def access_token(self):
-        """Return a valid Bearer token, or None if the user must re-auth in Antigravity."""
-        if TOKEN_CACHE.exists():
-            try:
-                cached = json.loads(TOKEN_CACHE.read_text())
-                if cached.get("expiry", 0) - 60 > time.time():
-                    return cached["token"]
-            except Exception:
-                pass
-
-        for refresh in (self._ide_refresh_token(), self._agy_refresh_token()):
-            if not refresh:
-                continue
-            token, expiry = self._refresh(refresh)
-            if token:
-                try:
-                    TOKEN_CACHE.write_text(json.dumps({"token": token, "expiry": expiry}))
-                    TOKEN_CACHE.chmod(0o600)  # bearer token — owner-only
-                except Exception:
-                    pass
-                return token
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -268,118 +427,136 @@ class CloudCodeClient:
 
 
 # ---------------------------------------------------------------------------
-# Pricing engine — live online every run, last-good cache fallback
+# ConversationStore — read Antigravity's local SQLite stores (read-only)
 # ---------------------------------------------------------------------------
 
-class PricingEngine:
-    """Per-million-token input/output rates fetched live from LiteLLM.
+class ConversationStore:
+    """Aggregates conversation activity from Antigravity's local stores.
 
-    On fetch failure, falls back to the last successful cache (flagged stale).
-    No static pricing is bundled — every price shown comes from real online data.
+    Reads `conversations/*.db` (SQLite + protobuf BLOBs) under both the CLI
+    and Antigravity 2.0 data dirs. All DBs are opened with `?mode=ro` so we
+    never lock or mutate Antigravity's live state.
+
+    What we reliably extract:
+      • Conversation count
+      • Step counts (per step_type, per month)
+      • Models used (from gen_metadata.field1.field19 — short model id like
+        "gemini-3-flash-a", "claude-sonnet-4-6")
+      • Date range (from file mtime as a proxy for last activity)
     """
 
-    PROVIDER_HINTS = ("gemini", "claude", "anthropic")
+    # Cortex step_type values, decoded from the agy binary's
+    # `jetski_cortex_go_proto.CortexStepType` enum. Only the most common
+    # user-facing types are labeled; unknown types fall through to "other".
+    STEP_TYPE_LABELS = {
+        14: "User input",
+        15: "Model response",
+        98: "Subagent call",
+        8:  "Tool call",
+        9:  "Tool call",
+        21: "Tool call",
+        23: "Tool call",
+        5:  "Tool call",
+        7:  "Tool call",
+        90: "Background task",
+    }
 
-    def __init__(self):
-        self.models, self.as_of, self.stale = self._load()
+    def __init__(self, dirs=None):
+        self.dirs = [Path(d) for d in (dirs or CONVERSATION_DIRS)]
 
-    def _load(self):
-        raw = http_get_json(LITELLM_PRICING_URL)
-        if raw:
-            models = {}
-            for key, val in raw.items():
-                kl = key.lower()
-                if not any(h in kl for h in self.PROVIDER_HINTS):
+    def aggregate(self):
+        """Return dict with conversation_count, step_total, by_month,
+        by_step_type, models, first_seen, last_seen."""
+        out = {
+            "conversation_count": 0,
+            "step_total": 0,
+            "by_month": defaultdict(lambda: {"conversations": 0, "steps": 0}),
+            "by_step_type": Counter(),
+            "models": Counter(),
+            "first_seen": None,
+            "last_seen": None,
+        }
+        seen_paths = set()
+        for d in self.dirs:
+            if not d.exists():
+                continue
+            for db_path in sorted(d.glob("*.db")):
+                if str(db_path) in seen_paths:
                     continue
-                ic = val.get("input_cost_per_token")
-                oc = val.get("output_cost_per_token")
-                if ic:
-                    models[key.split("/")[-1]] = {
-                        "input": ic * 1_000_000,
-                        "output": (oc or 0) * 1_000_000,
-                    }
-            if models:
-                as_of = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                try:
-                    PRICING_CACHE.write_text(json.dumps({"models": models, "as_of": as_of}))
-                except Exception:
-                    pass
-                return models, as_of, False
-        # Fallback: last successful fetch
-        if PRICING_CACHE.exists():
+                self._scan_one(db_path, out)
+                seen_paths.add(str(db_path))
+        return out
+
+    def _scan_one(self, db_path, out):
+        try:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        except sqlite3.Error:
+            return
+        try:
+            # Step counts + per-step-type breakdown
             try:
-                c = json.loads(PRICING_CACHE.read_text())
-                return c["models"], c.get("as_of", "unknown"), True
+                cur = con.execute(
+                    "SELECT step_type, COUNT(*) FROM steps GROUP BY step_type"
+                )
+                conv_steps = 0
+                for st, c in cur.fetchall():
+                    out["by_step_type"][int(st)] += int(c)
+                    conv_steps += int(c)
+                out["step_total"] += conv_steps
+            except sqlite3.Error:
+                conv_steps = 0
+
+            out["conversation_count"] += 1
+
+            # Per-month bucketing by file mtime (UTC). Per-row timestamps inside
+            # the protobuf are unreliable to extract without the full schema;
+            # mtime is a robust proxy for "when this conversation was active".
+            try:
+                m = db_path.stat().st_mtime
+                month = datetime.fromtimestamp(m, tz=timezone.utc).strftime("%Y-%m")
+                out["by_month"][month]["conversations"] += 1
+                out["by_month"][month]["steps"] += conv_steps
+                if out["first_seen"] is None or m < out["first_seen"]:
+                    out["first_seen"] = m
+                if out["last_seen"] is None or m > out["last_seen"]:
+                    out["last_seen"] = m
+            except OSError:
+                pass
+
+            # Model breakdown from gen_metadata BLOBs.
+            # Structure: gen_metadata.data.field1.field19 = short model id.
+            try:
+                cur = con.execute("SELECT data FROM gen_metadata")
+                for (data,) in cur.fetchall():
+                    if not isinstance(data, (bytes, bytearray)):
+                        continue
+                    model = self._extract_model(data)
+                    if model:
+                        out["models"][model] += 1
+            except sqlite3.Error:
+                pass
+        finally:
+            try:
+                con.close()
             except Exception:
                 pass
-        return {}, None, True
 
-    def rate(self, model):
-        """Return {'input','output'} for a model via exact then fuzzy match, or None."""
-        if not self.models:
-            return None
-        m = model.lower()
-        if m in self.models:
-            return self.models[m]
-        for key in sorted(self.models, key=len, reverse=True):
-            kl = key.lower()
-            if kl in m or m in kl:
-                return self.models[key]
+    @staticmethod
+    def _extract_model(gen_meta_blob):
+        """gen_metadata.field1 (nested proto).field19 = short model id."""
+        for fn, wire, val in proto_fields(gen_meta_blob):
+            if fn == 1 and wire == 2:
+                for sfn, swire, sval in proto_fields(val):
+                    if sfn == 19 and swire == 2:
+                        try:
+                            return sval.decode("utf-8")
+                        except Exception:
+                            return None
         return None
 
-    def cost(self, model, input_tokens, output_tokens, cached_tokens=0):
-        """Estimate USD cost. Cached input billed at 10% (standard read discount)."""
-        r = self.rate(model)
-        if not r:
-            return None
-        billable_in = max(input_tokens - cached_tokens, 0)
-        return (
-            billable_in / 1_000_000 * r["input"]
-            + cached_tokens / 1_000_000 * r["input"] * 0.10
-            + output_tokens / 1_000_000 * r["output"]
-        )
-
-
-# ---------------------------------------------------------------------------
-# Usage ledger — forward-captured per-turn tokens (written by the agy hook)
-# ---------------------------------------------------------------------------
-
-class UsageLedger:
-    """Reads the JSONL ledger appended by the Antigravity Stop hook.
-
-    Each line: {"ts": ISO8601, "model": str, "input": int, "output": int, "cached": int}
-    """
-
-    def __init__(self, path=LEDGER_FILE):
-        self.path = Path(path)
-
-    def by_month_model(self):
-        """Return month -> model -> {'input','output','cached','total'}.
-
-        `input` is the full prompt size and `cached` is the subset of it served
-        from cache (matching cost()'s `input - cached` billing), so the token
-        total is input + output — adding cached again would double-count it.
-        """
-        agg = defaultdict(lambda: defaultdict(lambda: {
-            "input": 0, "output": 0, "cached": 0, "total": 0
-        }))
-        if not self.path.exists():
-            return agg
-        for line in self.path.read_text(errors="ignore").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except Exception:
-                continue
-            month = (e.get("ts") or "")[:7] or "unknown"
-            model = e.get("model", "unknown")
-            cell = agg[month][model]
-            for k in ("input", "output", "cached"):
-                cell[k] += int(e.get(k, 0) or 0)
-            cell["total"] += sum(int(e.get(k, 0) or 0) for k in ("input", "output"))
-        return agg
+    @staticmethod
+    def label_step_type(step_type):
+        return ConversationStore.STEP_TYPE_LABELS.get(step_type, "other")
 
 
 # ---------------------------------------------------------------------------
@@ -387,9 +564,6 @@ class UsageLedger:
 # ---------------------------------------------------------------------------
 
 class Renderer:
-    def __init__(self, pricing):
-        self.pricing = pricing
-
     def live(self, tier, email, buckets):
         print("🛰️  Antigravity — Live Account")
         who = f" ({email})" if email else ""
@@ -409,154 +583,68 @@ class Renderer:
         filled = int(round(frac * width))
         return "[" + "█" * filled + "·" * (width - filled) + "]"
 
-    def history(self, agg):
-        months = sorted(agg.keys())
-        if not months:
-            print("\n📊 Captured token history: none yet.")
-            print("   Run `antigravity-usage --install-hook` to record usage going forward.")
+    def activity(self, agg):
+        print("\n📂 Conversation activity (local stores):")
+        if agg["conversation_count"] == 0:
+            print("   No conversations found. Use Antigravity, then re-run.")
             return
-        if self.pricing.stale:
-            print(f"\n⚠️  Pricing is stale (last fetched {self.pricing.as_of}); live source unreachable.")
-        print(f"\n📊 Captured token usage ({len(months)} month(s)), priced live:")
-        for month in months:
-            tokens = cost = 0
-            missing = False
-            for model, s in agg[month].items():
-                tokens += s["total"]
-                c = self.pricing.cost(model, s["input"], s["output"], s["cached"])
-                if c is None:
-                    missing = True
-                else:
-                    cost += c
-            flag = " (some models unpriced)" if missing else ""
-            print(f"• {month}: {tokens:,} tokens, Cost: ${cost:.2f}{flag}")
 
+        # Totals + date range
+        if agg["first_seen"] and agg["last_seen"]:
+            first = datetime.fromtimestamp(agg["first_seen"], tz=timezone.utc).date()
+            last = datetime.fromtimestamp(agg["last_seen"], tz=timezone.utc).date()
+            span = (last - first).days + 1
+            print(
+                f"• {agg['conversation_count']:,} conversations, "
+                f"{agg['step_total']:,} steps over {span} days "
+                f"({first} → {last})"
+            )
+        else:
+            print(
+                f"• {agg['conversation_count']:,} conversations, "
+                f"{agg['step_total']:,} steps"
+            )
 
-# ---------------------------------------------------------------------------
-# Hook installation (forward-capture)
-# ---------------------------------------------------------------------------
+        # Per-month breakdown
+        months = sorted(agg["by_month"].keys())
+        if months:
+            print("• By month:")
+            for month in months:
+                m = agg["by_month"][month]
+                print(f"    {month}: {m['conversations']:>4} conversations, {m['steps']:>6,} steps")
 
-HOOK_PLUGIN_DIR = HOME / ".gemini/antigravity-cli/plugins/antigravity-usage"
-
-
-def install_hook():
-    """Install an Antigravity Stop hook that records per-turn token usage."""
-    hooks_dir = HOOK_PLUGIN_DIR / "hooks"
-    hooks_dir.mkdir(parents=True, exist_ok=True)
-    recorder = hooks_dir / "record-usage.py"
-    recorder.write_text(_RECORDER_SOURCE)
-    recorder.chmod(0o755)
-    hooks_json = HOOK_PLUGIN_DIR / "hooks.json"
-    hooks_json.write_text(json.dumps({
-        "hooks": {
-            "Stop": [{
-                "matcher": "*",
-                "hooks": [{
-                    "type": "command",
-                    "command": f"python3 \"{recorder}\"",
-                    "async": True,
-                }],
-            }],
-        }
-    }, indent=2))
-    print(f"✅ Installed Antigravity usage hook → {hooks_json}")
-    print(f"   Recorder: {recorder}")
-    print(f"   Ledger:   {LEDGER_FILE}")
-    print("   New token usage will be captured after your next Antigravity turn.")
-
-
-# Source for the hook recorder. Reads the hook JSON payload from stdin and
-# appends a normalized usage line to the ledger. Defensive: tolerates unknown
-# payload shapes by scanning for usage/token fields.
-_RECORDER_SOURCE = r'''#!/usr/bin/env python3
-"""Antigravity Stop hook — append per-turn token usage to the ledger."""
-import json, sys, time, os
-
-LEDGER = os.path.expanduser("~/.gemini/antigravity-cli/usage-ledger.jsonl")
-
-
-def find_usage(obj):
-    """Return (model, input, output, cached) discovered anywhere in the payload.
-
-    Canonical contract: `input` is the FULL prompt size (including cached
-    tokens) and `cached` is the read-discounted subset of it. Providers differ
-    on whether cache reads are already inside their prompt count:
-      - Gemini `cachedContentTokenCount`     ⊂ promptTokenCount  (already in input)
-      - OpenAI `cached_tokens`               ⊂ prompt_tokens     (already in input)
-      - Anthropic `cache_read_input_tokens`  ✗ NOT in input_tokens (must be added)
-    So cache-read fields that sit outside the prompt count are folded into
-    `input`, making `input - cached` a correct billable figure for every
-    provider. (Anthropic `cache_creation_input_tokens` is billed at a premium,
-    not a discount, and is out of scope here.)
-    """
-    model = None
-    toks = {"input": 0, "output": 0, "cached_in_input": 0, "cached_separate": 0}
-    key_map = {
-        "input": ("input", "inputtokens", "input_tokens", "prompttokencount", "prompttokens"),
-        "output": ("output", "outputtokens", "output_tokens", "candidatestokencount", "completiontokens"),
-        # Cache reads already counted inside the prompt/input figure:
-        "cached_in_input": ("cached", "cachedcontenttokencount", "cached_tokens"),
-        # Cache reads reported separately from input (Anthropic, snake + camel):
-        "cached_separate": ("cache_read_input_tokens", "cachereadinputtokens"),
-    }
-
-    def walk(o):
-        nonlocal model
-        if isinstance(o, dict):
-            for k, v in o.items():
-                kl = str(k).lower()
-                if kl in ("model", "modelid", "modelversion") and isinstance(v, str) and not model:
-                    model = v
-                if isinstance(v, (int, float)):
-                    for dest, names in key_map.items():
-                        if kl in names:
-                            toks[dest] += int(v)
-                walk(v)
-        elif isinstance(o, list):
-            for v in o:
-                walk(v)
-
-    walk(obj)
-    input_full = toks["input"] + toks["cached_separate"]
-    cached = toks["cached_in_input"] + toks["cached_separate"]
-    return model, input_full, toks["output"], cached
-
-
-def main():
-    try:
-        payload = json.load(sys.stdin)
-    except Exception:
-        return
-    model, inp, out, cached = find_usage(payload)
-    if not (inp or out or cached):
-        return  # nothing to record
-    entry = {
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "model": model or payload.get("model", "unknown"),
-        "input": inp, "output": out, "cached": cached,
-        "session_id": payload.get("session_id"),
-    }
-    os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
-    with open(LEDGER, "a") as f:
-        f.write(json.dumps(entry) + "\n")
-
-
-if __name__ == "__main__":
-    main()
-'''
+        # Models used
+        if agg["models"]:
+            total = sum(agg["models"].values())
+            print(f"• Models used ({total:,} turns recorded):")
+            for model, count in agg["models"].most_common():
+                pct = count * 100.0 / total if total else 0
+                print(f"    {model:28} {count:>6,} turns ({pct:5.1f}%)")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+def _format_deprecated_install_hook():
+    return (
+        "The --install-hook flag is deprecated and now a no-op.\n"
+        "Token capture via Antigravity hooks was removed because the Stop event\n"
+        "payload does not carry token counts (per Antigravity's official hook docs)\n"
+        "and Antigravity does not persist per-token usage in client-readable form.\n"
+        "\n"
+        "Conversation activity is now read directly from Antigravity's own local\n"
+        "SQLite stores — no hook required."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Live quota + token-cost tracker for Google Antigravity."
+        description="Live quota + conversation activity for Google Antigravity."
     )
     parser.add_argument(
         "--install-hook", action="store_true",
-        help="Install the Antigravity Stop hook that records token usage going forward.",
+        help="(deprecated, no-op) Previously installed a usage-capture hook.",
     )
     parser.add_argument(
         "--no-live", action="store_true",
@@ -565,11 +653,10 @@ def main():
     args = parser.parse_args()
 
     if args.install_hook:
-        install_hook()
+        print(_format_deprecated_install_hook())
         return
 
-    pricing = PricingEngine()
-    renderer = Renderer(pricing)
+    renderer = Renderer()
 
     if not args.no_live:
         token = AntigravityAuth().access_token()
@@ -581,7 +668,7 @@ def main():
             print("🛰️  Antigravity — Live Account")
             print("• Unavailable: no valid credentials. Sign in via the Antigravity app/CLI, then retry.")
 
-    renderer.history(UsageLedger().by_month_model())
+    renderer.activity(ConversationStore().aggregate())
 
 
 if __name__ == "__main__":
