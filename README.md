@@ -85,6 +85,15 @@ needed.
 
 ### Example output
 
+`--no-live` (matches the `oc-usage` / `ccusage` one-line-per-month format):
+
+```text
+📊 Antigravity Usage (last 2 months):
+• 2026-06: 7,211,600 tokens, Cost: $4.18
+```
+
+Full run (adds the live account/quota block on top):
+
 ```text
 🛰️  Antigravity — Live Account
 • Plan: Gemini Code Assist in Google One AI Pro (you@example.com)
@@ -93,18 +102,16 @@ needed.
     gemini-2.5-pro               [████████████] 100.0%  (REQUESTS, reset 2026-06-28 09:27)
 
 📊 Antigravity Usage (last 2 months):
-• 2026-06: 44 conversations, 3,036 steps, est. $4.18
+• 2026-06: 7,211,600 tokens, Cost: $4.18
 ```
 
-> Activity accrues from the moment Antigravity first runs and writes to its
-> local stores. No setup, hook, or daemon is required on your part.
->
-> **Cost is an estimate.** Antigravity does not persist per-token usage
-> client-readably, so we use assumed per-turn token counts (typical for
-> agentic coding) × live per-model rates from
-> [LiteLLM](https://github.com/BerriAI/litellm). Treat the dollar figure as
-> a ballpark, not an invoice. If the live pricing fetch fails, the last good
-> rates are reused and a `pricing is STALE` warning is printed.
+> **Both figures are estimates.** Antigravity does not persist per-token usage
+> client-readably, so tokens come from per-turn assumptions (typical for
+> agentic coding) × real per-model turn counts, and cost is those tokens ×
+> live per-model rates from [LiteLLM](https://github.com/BerriAI/litellm).
+> Treat the numbers as a ballpark, not an invoice. If the live pricing fetch
+> fails, the last good rates are reused and a `pricing is STALE` warning is
+> printed on stderr.
 
 ## Data sources
 

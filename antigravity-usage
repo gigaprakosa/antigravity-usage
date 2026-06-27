@@ -569,13 +569,15 @@ class ConversationStore:
         self.dirs = [Path(d) for d in (dirs or CONVERSATION_DIRS)]
 
     def aggregate(self, pricing):
-        """Return dict with by_month: {YYYY-MM: {conversations, steps, cost,
-        models: Counter}}. `pricing` is a PricingEngine for cost estimation;
-        pass None to skip cost."""
+        """Return dict with by_month: {YYYY-MM: {tokens, cost}}.
+
+        `tokens` is the estimated total (sum of assumed per-turn input+output
+        across every model-response turn). `cost` is tokens × live rates.
+        `pricing` is a PricingEngine; pass None to skip cost.
+        """
         out = {
             "by_month": defaultdict(lambda: {
-                "conversations": 0, "steps": 0, "cost": 0.0,
-                "models": Counter(),
+                "tokens": 0, "cost": 0.0, "_models": Counter(),
             }),
         }
         seen_paths = set()
@@ -595,16 +597,6 @@ class ConversationStore:
         except sqlite3.Error:
             return
         try:
-            # Sum all steps in this conversation.
-            conv_steps = 0
-            try:
-                cur = con.execute("SELECT COUNT(*) FROM steps")
-                row = cur.fetchone()
-                if row:
-                    conv_steps = int(row[0])
-            except sqlite3.Error:
-                pass
-
             # Per-model turn counts from gen_metadata BLOBs.
             # Structure: gen_metadata.data.field1.field19 = short model id
             # (e.g. "gemini-3-flash-a", "claude-sonnet-4-6").
@@ -627,10 +619,10 @@ class ConversationStore:
                 m = db_path.stat().st_mtime
                 month = datetime.fromtimestamp(m, tz=timezone.utc).strftime("%Y-%m")
                 cell = out["by_month"][month]
-                cell["conversations"] += 1
-                cell["steps"] += conv_steps
                 for model, turns in conv_models.items():
-                    cell["models"][model] += turns
+                    cell["_models"][model] += turns
+                    inp, outp = assumed_tokens_for_turn(model)
+                    cell["tokens"] += turns * (inp + outp)
                 if pricing is not None:
                     cell["cost"] += self._estimate_cost(pricing, conv_models)
             except OSError:
@@ -698,14 +690,16 @@ class Renderer:
         return "[" + "█" * filled + "·" * (width - filled) + "]"
 
     def activity(self, agg, pricing):
-        """Render the per-month activity block (opencode-usage-style: header +
-        one bullet per month in the window, with estimated cost).
+        """Render the per-month activity block in oc-usage / ccusage format:
+        one header line, one bullet per month in the window showing estimated
+        tokens and cost.
 
-        Cost is an estimate: Antigravity doesn't persist per-token usage
-        client-readable, so we use assumed per-turn tokens × live LiteLLM
-        rates. Stale pricing (live fetch failed) is flagged separately.
+        Both figures are estimates: Antigravity doesn't persist per-token
+        usage client-readably, so tokens come from the ASSUMED_TOKENS_PER_TURN
+        table × real per-model turn counts, and cost is those tokens × live
+        LiteLLM rates. Stale pricing (live fetch failed) is flagged on stderr.
         """
-        print(f"\n📊 Antigravity Usage (last {MONTHS_BACK} months):")
+        print(f"📊 Antigravity Usage (last {MONTHS_BACK} months):")
         if pricing and pricing.stale:
             print(
                 f"  ⚠ pricing is STALE (live LiteLLM fetch failed; "
@@ -719,11 +713,8 @@ class Renderer:
             return
         for month in months:
             m = agg["by_month"][month]
-            cost_str = f", est. ${m['cost']:,.2f}" if pricing and pricing.models else ""
-            print(
-                f"• {month}: {m['conversations']:,} conversations, "
-                f"{m['steps']:,} steps{cost_str}"
-            )
+            cost_str = f", Cost: ${m['cost']:,.2f}" if pricing and pricing.models else ""
+            print(f"• {month}: {m['tokens']:,} tokens{cost_str}")
 
 
 # ---------------------------------------------------------------------------
@@ -772,6 +763,7 @@ def main():
         else:
             print("🛰️  Antigravity — Live Account")
             print("• Unavailable: no valid credentials. Sign in via the Antigravity app/CLI, then retry.")
+        print()  # separator between live block and activity block
 
     renderer.activity(ConversationStore().aggregate(pricing), pricing)
 
