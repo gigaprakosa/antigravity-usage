@@ -40,7 +40,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import defaultdict
+from collections import defaultdict, Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -73,6 +73,11 @@ MONTHS_BACK = 2
 
 # Per-run caches (owner-only).
 TOKEN_CACHE = HOME / ".gemini/antigravity-usage-token.json"
+PRICING_CACHE = HOME / ".gemini/antigravity-usage-pricing-cache.json"
+
+# Live per-million-token pricing source. Fetched every run; on failure the
+# last successful fetch is reused (flagged stale).
+LITELLM_PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +94,15 @@ def http_post(url, data, headers, timeout=25):
         return e.code, e.read().decode()
     except Exception as e:
         return None, str(e)
+
+
+def http_get_json(url, timeout=30):
+    """GET and parse JSON, or return None on any failure."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +444,103 @@ class CloudCodeClient:
 
 
 # ---------------------------------------------------------------------------
+# PricingEngine — live per-million rates from LiteLLM (with stale fallback)
+# ---------------------------------------------------------------------------
+
+class PricingEngine:
+    """Per-million-token input/output rates fetched live from LiteLLM.
+
+    Antigravity does not persist per-token usage anywhere client-readable, so
+    we estimate cost from per-turn token assumptions × live rates. Rates are
+    always current; on fetch failure the last successful fetch is reused
+    (flagged stale). No pricing is bundled in source.
+    """
+
+    PROVIDER_HINTS = ("gemini", "claude", "anthropic", "gpt-oss")
+
+    def __init__(self):
+        self.models, self.as_of, self.stale = self._load()
+
+    def _load(self):
+        raw = http_get_json(LITELLM_PRICING_URL)
+        if raw:
+            models = {}
+            for key, val in raw.items():
+                kl = key.lower()
+                if not any(h in kl for h in self.PROVIDER_HINTS):
+                    continue
+                ic = val.get("input_cost_per_token")
+                oc = val.get("output_cost_per_token")
+                if ic:
+                    models[key.split("/")[-1].lower()] = {
+                        "input": ic * 1_000_000,
+                        "output": (oc or 0) * 1_000_000,
+                    }
+            if models:
+                as_of = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                try:
+                    PRICING_CACHE.write_text(json.dumps({"models": models, "as_of": as_of}))
+                    PRICING_CACHE.chmod(0o600)
+                except Exception:
+                    pass
+                return models, as_of, False
+        if PRICING_CACHE.exists():
+            try:
+                c = json.loads(PRICING_CACHE.read_text())
+                return c["models"], c.get("as_of", "unknown"), True
+            except Exception:
+                pass
+        return {}, None, True
+
+    def rate(self, model):
+        """Return {'input','output'} per-million rates via exact then fuzzy
+        match, or None if unrated."""
+        if not self.models:
+            return None
+        m = model.lower()
+        if m in self.models:
+            return self.models[m]
+        # Try the short id (after last slash) — LiteLLM keys vary.
+        short = m.split("/")[-1]
+        if short in self.models:
+            return self.models[short]
+        for key in sorted(self.models, key=len, reverse=True):
+            if key in m or m in key:
+                return self.models[key]
+        return None
+
+
+# Approximate tokens per "model response" turn in agentic coding. Antigravity
+# does not persist real counts; these are typical ratios seen in Claude Code /
+# Cursor-style agents. Cost is an ESTIMATE — display it as such. Order matters:
+# first prefix match wins, so list more-specific prefixes before general ones.
+ASSUMED_TOKENS_PER_TURN = [
+    ("gemini-2.5-flash-lite", 3000, 400),
+    ("gemini-2.5-flash",      4000, 500),
+    ("gemini-3-flash",        4000, 500),
+    ("gemini-3.1-flash",      4000, 500),
+    ("gemini-2.5-pro",        8000, 800),
+    ("gemini-3-pro",          8000, 800),
+    ("gemini-pro",            8000, 800),
+    ("claude-opus",          10000, 900),
+    ("claude-sonnet",         8000, 700),
+    ("claude-haiku",          3000, 400),
+    ("gpt-oss-120b",          6000, 600),
+    ("gpt-oss",               6000, 600),
+]
+DEFAULT_ASSUMED_TOKENS = (5000, 600)
+
+
+def assumed_tokens_for_turn(model):
+    """Return (input, output) tokens for one model-response turn of `model`."""
+    m = model.lower()
+    for prefix, inp, out in ASSUMED_TOKENS_PER_TURN:
+        if m.startswith(prefix):
+            return inp, out
+    return DEFAULT_ASSUMED_TOKENS
+
+
+# ---------------------------------------------------------------------------
 # ConversationStore — read Antigravity's local SQLite stores (read-only)
 # ---------------------------------------------------------------------------
 
@@ -450,16 +561,23 @@ class ConversationStore:
 
     Reads `conversations/*.db` (SQLite) under both the CLI and Antigravity 2.0
     data dirs. All DBs are opened with `?mode=ro` so we never lock or mutate
-    Antigravity's live state. Aggregates just what the simple per-month report
-    needs: conversations and step counts.
+    Antigravity's live state. Aggregates per-month conversations, step counts,
+    and the per-model turn counts needed for cost estimation.
     """
 
     def __init__(self, dirs=None):
         self.dirs = [Path(d) for d in (dirs or CONVERSATION_DIRS)]
 
-    def aggregate(self):
-        """Return dict with by_month: {YYYY-MM: {conversations, steps}}."""
-        out = {"by_month": defaultdict(lambda: {"conversations": 0, "steps": 0})}
+    def aggregate(self, pricing):
+        """Return dict with by_month: {YYYY-MM: {conversations, steps, cost,
+        models: Counter}}. `pricing` is a PricingEngine for cost estimation;
+        pass None to skip cost."""
+        out = {
+            "by_month": defaultdict(lambda: {
+                "conversations": 0, "steps": 0, "cost": 0.0,
+                "models": Counter(),
+            }),
+        }
         seen_paths = set()
         for d in self.dirs:
             if not d.exists():
@@ -467,11 +585,11 @@ class ConversationStore:
             for db_path in sorted(d.glob("*.db")):
                 if str(db_path) in seen_paths:
                     continue
-                self._scan_one(db_path, out)
+                self._scan_one(db_path, out, pricing)
                 seen_paths.add(str(db_path))
         return out
 
-    def _scan_one(self, db_path, out):
+    def _scan_one(self, db_path, out, pricing):
         try:
             con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         except sqlite3.Error:
@@ -487,14 +605,34 @@ class ConversationStore:
             except sqlite3.Error:
                 pass
 
+            # Per-model turn counts from gen_metadata BLOBs.
+            # Structure: gen_metadata.data.field1.field19 = short model id
+            # (e.g. "gemini-3-flash-a", "claude-sonnet-4-6").
+            conv_models = Counter()
+            try:
+                cur = con.execute("SELECT data FROM gen_metadata")
+                for (data,) in cur.fetchall():
+                    if not isinstance(data, (bytes, bytearray)):
+                        continue
+                    model = self._extract_model(data)
+                    if model:
+                        conv_models[model] += 1
+            except sqlite3.Error:
+                pass
+
             # Bucket by month using the DB's mtime (UTC). Per-step timestamps
             # live inside protobuf BLOBs without a published schema; mtime is a
             # robust proxy for "when this conversation was last active".
             try:
                 m = db_path.stat().st_mtime
                 month = datetime.fromtimestamp(m, tz=timezone.utc).strftime("%Y-%m")
-                out["by_month"][month]["conversations"] += 1
-                out["by_month"][month]["steps"] += conv_steps
+                cell = out["by_month"][month]
+                cell["conversations"] += 1
+                cell["steps"] += conv_steps
+                for model, turns in conv_models.items():
+                    cell["models"][model] += turns
+                if pricing is not None:
+                    cell["cost"] += self._estimate_cost(pricing, conv_models)
             except OSError:
                 pass
         finally:
@@ -502,6 +640,37 @@ class ConversationStore:
                 con.close()
             except Exception:
                 pass
+
+    @staticmethod
+    def _extract_model(gen_meta_blob):
+        """gen_metadata.field1 (nested proto).field19 = short model id."""
+        for fn, wire, val in proto_fields(gen_meta_blob):
+            if fn == 1 and wire == 2:
+                for sfn, swire, sval in proto_fields(val):
+                    if sfn == 19 and swire == 2:
+                        try:
+                            return sval.decode("utf-8")
+                        except Exception:
+                            return None
+        return None
+
+    @staticmethod
+    def _estimate_cost(pricing, model_turns):
+        """Sum estimated cost across models using assumed per-turn tokens ×
+        live rates. Returns 0.0 if no models or no pricing."""
+        if not pricing.models:
+            return 0.0
+        total = 0.0
+        for model, turns in model_turns.items():
+            rate = pricing.rate(model)
+            if not rate:
+                continue
+            inp, out = assumed_tokens_for_turn(model)
+            total += turns * (
+                inp * rate["input"] / 1_000_000
+                + out * rate["output"] / 1_000_000
+            )
+        return total
 
 
 # ---------------------------------------------------------------------------
@@ -528,10 +697,21 @@ class Renderer:
         filled = int(round(frac * width))
         return "[" + "█" * filled + "·" * (width - filled) + "]"
 
-    def activity(self, agg):
+    def activity(self, agg, pricing):
         """Render the per-month activity block (opencode-usage-style: header +
-        one bullet per month in the window)."""
+        one bullet per month in the window, with estimated cost).
+
+        Cost is an estimate: Antigravity doesn't persist per-token usage
+        client-readable, so we use assumed per-turn tokens × live LiteLLM
+        rates. Stale pricing (live fetch failed) is flagged separately.
+        """
         print(f"\n📊 Antigravity Usage (last {MONTHS_BACK} months):")
+        if pricing and pricing.stale:
+            print(
+                f"  ⚠ pricing is STALE (live LiteLLM fetch failed; "
+                f"using cached rates from {pricing.as_of})",
+                file=sys.stderr,
+            )
         start_month = _window_start_month()
         months = sorted(m for m in agg["by_month"] if m >= start_month)
         if not months:
@@ -539,7 +719,11 @@ class Renderer:
             return
         for month in months:
             m = agg["by_month"][month]
-            print(f"• {month}: {m['conversations']:,} conversations, {m['steps']:,} steps")
+            cost_str = f", est. ${m['cost']:,.2f}" if pricing and pricing.models else ""
+            print(
+                f"• {month}: {m['conversations']:,} conversations, "
+                f"{m['steps']:,} steps{cost_str}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +761,7 @@ def main():
         return
 
     renderer = Renderer()
+    pricing = PricingEngine()
 
     if not args.no_live:
         token = AntigravityAuth().access_token()
@@ -588,7 +773,7 @@ def main():
             print("🛰️  Antigravity — Live Account")
             print("• Unavailable: no valid credentials. Sign in via the Antigravity app/CLI, then retry.")
 
-    renderer.activity(ConversationStore().aggregate())
+    renderer.activity(ConversationStore().aggregate(pricing), pricing)
 
 
 if __name__ == "__main__":

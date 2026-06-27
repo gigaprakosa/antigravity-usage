@@ -18,26 +18,26 @@ per-token usage to subscribers in any client-readable form. Local conversation
 files are SQLite + protobuf BLOBs (not encrypted, but token counts are not
 persisted in them), the JSONL transcripts carry no `UsageMetadata`, and the
 CloudCode API's `retrieveUserQuota` returns only REQUEST-type quota (not
-tokens). `retrieveUserQuotaSummary` is 403 for normal subscriber accounts.
+tokens). `retrieveUserQuotaSummary` is 403 for normal accounts.
 
-So this tool reports the two things that **are** authoritative and readable:
+So this tool reports usage from the two authoritative client-readable sources:
 
 1. **Live account** — queries the Google CloudCode API for your tier and
    per-model quota remaining, authenticating with your existing Antigravity
    session (no extra login).
 2. **Conversation activity** — reads Antigravity's local SQLite conversation
-   stores directly and aggregates them into conversation counts, step totals,
-   per-month breakdown, and the actual model mix you've been using.
-
-This tool deliberately does **not** estimate USD cost. Without a reliable
-per-token source, any cost figure would be fabricated, so we show none.
+   stores directly and aggregates them into per-month conversation counts,
+   step totals, and an **estimated** cost (assumed per-turn tokens × live
+   per-model rates from LiteLLM).
 
 ## Features
 
 - **Live tier & quota:** plan name and per-model quota remaining with reset times.
-- **Conversation activity:** total conversations, step counts, per-month
-  breakdown, and the models actually used (e.g. `gemini-3-flash-a`,
-  `claude-sonnet-4-6`), sourced from Antigravity's own `conversations/*.db`.
+- **Conversation activity:** per-month conversations, steps, and estimated
+  cost — sourced from Antigravity's own `conversations/*.db`.
+- **Live pricing:** per-model rates fetched fresh from
+  [LiteLLM](https://github.com/BerriAI/litellm) every run, with last-good
+  cache reused (flagged stale) only if the source is unreachable.
 - **Read-only:** every SQLite store is opened with `?mode=ro` — Antigravity's
   live state is never locked or mutated.
 - **Zero dependencies:** pure Python 3 standard library.
@@ -93,11 +93,18 @@ needed.
     gemini-2.5-pro               [████████████] 100.0%  (REQUESTS, reset 2026-06-28 09:27)
 
 📊 Antigravity Usage (last 2 months):
-• 2026-06: 44 conversations, 3,036 steps
+• 2026-06: 44 conversations, 3,036 steps, est. $4.18
 ```
 
 > Activity accrues from the moment Antigravity first runs and writes to its
 > local stores. No setup, hook, or daemon is required on your part.
+>
+> **Cost is an estimate.** Antigravity does not persist per-token usage
+> client-readably, so we use assumed per-turn token counts (typical for
+> agentic coding) × live per-model rates from
+> [LiteLLM](https://github.com/BerriAI/litellm). Treat the dollar figure as
+> a ballpark, not an invoice. If the live pricing fetch fails, the last good
+> rates are reused and a `pricing is STALE` warning is printed.
 
 ## Data sources
 

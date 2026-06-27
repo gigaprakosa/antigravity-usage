@@ -28,10 +28,10 @@ per-token usage to subscribers in any client-readable form. Specifically:
 
 So usage is sourced from the two authoritative places that ARE client-readable:
 the live CloudCode API for tier/quota, and Antigravity's local conversation
-SQLite stores for activity metrics.
-
-The tool deliberately does **not** estimate USD cost. Without a reliable
-per-token source, any cost figure would be fabricated.
+SQLite stores for activity metrics. Cost is an **estimate**: assumed per-turn
+tokens × live per-model rates from LiteLLM. The estimate is labeled as such
+in output (`est. $X.XX`) because the real per-turn token counts are not
+recoverable.
 
 ## Architecture (SOLID, single-responsibility units)
 - **`AntigravityAuth`** — mints a Bearer for the user's own account. Walks the
@@ -44,17 +44,25 @@ per-token source, any cost figure would be fabricated.
 - **`CloudCodeClient`** — `cloudcode-pa.googleapis.com`:
   `v1internal:loadCodeAssist` (tier) and `v1internal:retrieveUserQuota`
   (per-model quota remaining).
+- **`PricingEngine`** — fetches live per-million rates from the LiteLLM
+  database every run; on failure falls back to the last successful cache,
+  flagged stale. No pricing is bundled in source.
 - **`ConversationStore`** — opens `~/.gemini/antigravity-cli/conversations/*.db`
   and `~/.gemini/antigravity/conversations/*.db` in read-only SQLite mode and
-  aggregates: conversation count, step totals (per `step_type`), per-month
-  buckets, and the model mix (from `gen_metadata.data.field1.field19`).
-- **`Renderer`** — formats the live account block and the activity block.
+  aggregates per-month: conversation count, step totals, per-model turn
+  counts (from `gen_metadata.data.field1.field19`), and an estimated cost
+  using `ASSUMED_TOKENS_PER_TURN` × live rates.
+- **`Renderer`** — formats the live account block and the per-month activity
+  block (with cost).
 
 ## Conventions
 - Follow [PEP 8](https://www.python.org/dev/peps/pep-0008/).
 - **Zero external dependencies** — standard library only.
-- **No cost estimation** — never reintroduce a fabricated USD figure. If a
-  future Antigravity release exposes real per-token usage, add it then.
+- **Cost is always an estimate, always labeled.** Antigravity doesn't persist
+  per-token usage client-readable, so cost uses assumed per-turn tokens ×
+  live LiteLLM rates. Always render with the `est.` prefix so users don't
+  mistake it for an invoice. If a future Antigravity release exposes real
+  per-token usage, swap the estimate for the real calculation at that point.
 - **Read-only on Antigravity state** — every SQLite open uses `?mode=ro`.
 - **No AI Attribution** in commit messages.
 
