@@ -1,65 +1,39 @@
 #!/usr/bin/env python3
-"""Antigravity Usage — live quota + conversation activity for Google Antigravity.
+"""Antigravity Usage — conversation activity + estimated cost for Google
+Antigravity.
 
-Scope: Google Antigravity only (CLI + IDE). The legacy Gemini CLI is deprecated
-(EOL 2026-06-18) and is intentionally NOT a data source here.
+Scope: Google Antigravity only (CLI + IDE). The legacy Gemini CLI is
+deprecated (EOL 2026-06-18) and is intentionally NOT a data source here.
 
-This tool reports usage from the two sources that ARE authoritative and
-client-readable:
+Reads Antigravity's local SQLite conversation stores directly and reports
+per-month tokens and cost for the last 2 months — same one-line-per-month
+format as oc-usage / ccusage. Both figures are estimates: Antigravity does
+not persist per-token usage in any client-readable form (transcripts discard
+UsageMetadata, the conversation SQLite stores carry step content but no
+token counts, retrieveUserQuota returns REQUEST-type quota only). So tokens
+come from per-turn assumptions × real per-model turn counts, and cost is
+those tokens × live per-model rates from LiteLLM.
 
-  1. Live account state — Google CloudCode API (tier + per-model quota remaining).
-  2. Conversation activity — Antigravity's own local SQLite stores
-     (~/.gemini/antigravity-cli/conversations/*.db and the antigravity/ sibling),
-     aggregated into per-month conversation counts, assistant turns, and the
-   model mix actually used.
-
-What this tool deliberately does NOT do: estimate USD cost. Antigravity is
-billed as a flat-rate subscription, so Google does not persist per-token
-usage metadata in any client-readable form (transcripts discard
-UsageMetadata; the conversation SQLite stores carry step content but no
-token counts; retrieveUserQuota returns only REQUEST-type quota, not
-tokens; retrieveUserQuotaSummary is 403 for normal accounts). Any "cost"
-number would be fabricated, so we show none.
+Zero external dependencies — Python 3 standard library only.
 
 Design (SOLID): each concern is an isolated unit —
-  AntigravityAuth     → mint a Bearer from the IDE-stored refresh token
-  CloudCodeClient     → call loadCodeAssist / retrieveUserQuota
+  PricingEngine       → live per-million rates from LiteLLM
   ConversationStore   → read + aggregate Antigravity's conversation DBs
   Renderer            → format output
 """
 
 import argparse
-import base64
-import glob
 import json
-import os
-import re
 import sqlite3
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from collections import defaultdict, Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 HOME = Path.home()
-CLOUDCODE_HOST = "https://cloudcode-pa.googleapis.com"
-OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
-
-# OAuth client pair source. The pair ships inside the publicly distributed
-# `agy` binary (and the Antigravity.app bundle); we extract it at runtime
-# rather than hardcoding, so this source carries no credentials and survives
-# Google rotating the pair. Cached after first successful refresh.
-AGY_BINARY = HOME / ".local/bin/agy"
-OAUTH_CLIENT_CACHE = HOME / ".gemini/antigravity-usage-oauth-client.json"
-
-# Auth sources (probed in order).
-IDE_STATE_DBS = [
-    HOME / "Library/Application Support/Antigravity/User/globalStorage/state.vscdb",
-]
-AGY_OAUTH_CREDS = HOME / ".gemini/oauth_creds.json"
 
 # Conversation stores. Antigravity CLI writes under antigravity-cli/; the
 # Antigravity 2.0 IDE uses antigravity/ with the same SQLite schema.
@@ -71,30 +45,14 @@ CONVERSATION_DIRS = [
 # Report window: current month + previous (N-1) months.
 MONTHS_BACK = 2
 
-# Per-run caches (owner-only).
-TOKEN_CACHE = HOME / ".gemini/antigravity-usage-token.json"
+# Pricing cache (owner-only). Live per-million-token rates come from LiteLLM.
 PRICING_CACHE = HOME / ".gemini/antigravity-usage-pricing-cache.json"
-
-# Live per-million-token pricing source. Fetched every run; on failure the
-# last successful fetch is reused (flagged stale).
 LITELLM_PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers
+# HTTP helper
 # ---------------------------------------------------------------------------
-
-def http_post(url, data, headers, timeout=25):
-    """POST and return (status, body_text). Never raises."""
-    req = urllib.request.Request(url, data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, r.read().decode()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode()
-    except Exception as e:
-        return None, str(e)
-
 
 def http_get_json(url, timeout=30):
     """GET and parse JSON, or return None on any failure."""
@@ -121,10 +79,7 @@ def _read_varint(buf, i):
 
 
 def proto_fields(buf):
-    """Yield (field_number, wire_type, raw_value) for every top-level field.
-
-    wire_type: 0 = varint, 2 = length-delimited bytes.
-    """
+    """Yield (field_number, wire_type, raw_value) for every top-level field."""
     i, n = 0, len(buf)
     while i < n:
         tag, i = _read_varint(buf, i)
@@ -144,305 +99,6 @@ def proto_fields(buf):
             break
 
 
-def proto_string_fields(buf):
-    """Back-compat shim: yield (field_number, bytes) for wire-type-2 fields."""
-    for fn, wire, val in proto_fields(buf):
-        if wire == 2:
-            yield fn, val
-
-
-# ---------------------------------------------------------------------------
-# Auth — mint a Bearer access token for the user's Antigravity account
-# ---------------------------------------------------------------------------
-
-class AntigravityAuth:
-    """Resolves a valid OAuth Bearer token for CloudCode calls.
-
-    Order of preference:
-      1. Cached non-expired token from a previous run.
-      2. Refresh token embedded in the Antigravity IDE state DB
-         (antigravityUnifiedStateSync.oauthToken key, double-base64 envelope
-         containing an OAuthTokenInfo protobuf with refresh_token at field 3).
-      3. Refresh token in the agy CLI's oauth_creds.json.
-
-    The OAuth client_id/secret used to refresh is NOT hardcoded — it's scanned
-    from the public agy binary on first run, then cached. Nothing ships in
-    this source.
-    """
-
-    def access_token(self):
-        """Return a valid Bearer token, or None if the user must re-auth."""
-        cached = self._cached_token()
-        if cached:
-            return cached
-
-        for refresh in (self._ide_refresh_token(), self._agy_refresh_token()):
-            if not refresh:
-                continue
-            token, expiry = self._refresh(refresh)
-            if token:
-                self._cache_token(token, expiry)
-                return token
-        return None
-
-    # --- cache -------------------------------------------------------------
-
-    @staticmethod
-    def _cached_token():
-        if not TOKEN_CACHE.exists():
-            return None
-        try:
-            cached = json.loads(TOKEN_CACHE.read_text())
-            if cached.get("expiry", 0) - 60 > time.time():
-                return cached["token"]
-        except Exception:
-            pass
-        return None
-
-    @staticmethod
-    def _cache_token(token, expiry):
-        try:
-            TOKEN_CACHE.write_text(json.dumps({"token": token, "expiry": expiry}))
-            TOKEN_CACHE.chmod(0o600)  # bearer token — owner-only
-        except Exception:
-            pass
-
-    # --- refresh-token sources --------------------------------------------
-
-    def _ide_refresh_token(self):
-        """Walk the documented nested-protobuf envelope to field 3 (refresh).
-
-        Decode chain (verified against community fixtures in
-        Draculabo/AntigravityManager and abuhanna/winusage):
-
-            value (b64) → wrapper proto
-              wrapper.field 1 → inner proto
-                inner.field 1 = sentinel string "oauthTokenInfoSentinelKey"
-                inner.field 2 = payload proto
-                  payload.field 1 = utf-8 base64 string
-                    b64-decode → OAuthTokenInfo proto
-                      OAuthTokenInfo.field 3 = refresh_token (string)
-        """
-        for db_path in IDE_STATE_DBS:
-            if not db_path.exists():
-                continue
-            try:
-                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-                row = con.execute(
-                    "SELECT value FROM ItemTable WHERE key LIKE '%oauthToken%' "
-                    "ORDER BY LENGTH(value) DESC LIMIT 1"
-                ).fetchone()
-                con.close()
-            except Exception:
-                continue
-            if not row:
-                continue
-            token = self._extract_refresh_from_envelope(row[0])
-            if token:
-                return token
-        return None
-
-    @staticmethod
-    def _extract_refresh_from_envelope(raw):
-        """Decode the antigravityUnifiedStateSync.oauthToken envelope.
-
-        The wrapper proto carries multiple field-1 sections, each keyed by a
-        sentinel string in inner.field 1. We want the one whose sentinel is
-        "oauthTokenInfoSentinelKey". Inside that section:
-
-            inner.field 2 = payload proto
-              payload.field 1 = utf-8 base64 string
-                b64-decode → OAuthTokenInfo proto
-                  OAuthTokenInfo.field 3 = refresh_token (string)
-        """
-        if raw is None:
-            return None
-        if isinstance(raw, bytes):
-            try:
-                raw = raw.decode("utf-8", errors="ignore")
-            except Exception:
-                return None
-        raw = raw.strip().strip('"')
-        try:
-            wrapper = base64.b64decode(raw + "==")
-        except Exception:
-            return None
-
-        # Find the field-1 section whose inner.field 1 is the OAuth sentinel.
-        payload = None
-        for fn, wire, val in proto_fields(wrapper):
-            if fn != 1 or wire != 2:
-                continue
-            sentinel = None
-            section_payload = None
-            for sfn, swire, sval in proto_fields(val):
-                if sfn == 1 and swire == 2:
-                    try:
-                        sentinel = sval.decode("utf-8")
-                    except Exception:
-                        pass
-                elif sfn == 2 and swire == 2:
-                    section_payload = sval
-            if sentinel == "oauthTokenInfoSentinelKey" and section_payload is not None:
-                payload = section_payload
-                break
-        if payload is None:
-            return None
-
-        # payload.field 1 is a utf-8 base64 string of OAuthTokenInfo.
-        oauth_b64 = None
-        for fn, wire, val in proto_fields(payload):
-            if fn == 1 and wire == 2:
-                oauth_b64 = val
-                break
-        if oauth_b64 is None:
-            return None
-        try:
-            oauth_info = base64.b64decode(oauth_b64.decode("utf-8") + "==")
-        except Exception:
-            return None
-        # OAuthTokenInfo.field 3 = refresh_token.
-        for fn, wire, val in proto_fields(oauth_info):
-            if fn == 3 and wire == 2:
-                try:
-                    return val.decode("utf-8")
-                except Exception:
-                    return val.decode("latin1")
-        return None
-
-    @staticmethod
-    def _agy_refresh_token():
-        try:
-            return json.loads(AGY_OAUTH_CREDS.read_text()).get("refresh_token")
-        except Exception:
-            return None
-
-    # --- OAuth client pair (extracted from agy, cached) -------------------
-
-    def _oauth_client_pairs(self):
-        """Return list of (client_id, client_secret) candidates.
-
-        The pair ships inside the publicly distributed agy binary; we extract
-        it at runtime so this source carries no credentials and survives Google
-        rotating the pair. After the first successful refresh the working pair
-        is cached and reused, so subsequent runs skip the 142MB binary scan.
-        """
-        cached = self._load_cached_client_pair()
-        if cached:
-            return [cached]
-        return self._discover_client_pairs()
-
-    @staticmethod
-    def _load_cached_client_pair():
-        if not OAUTH_CLIENT_CACHE.exists():
-            return None
-        try:
-            d = json.loads(OAUTH_CLIENT_CACHE.read_text())
-            pair = d.get("pair")
-            if pair and len(pair) == 2:
-                return (pair[0], pair[1])
-        except Exception:
-            pass
-        return None
-
-    @staticmethod
-    def _cache_client_pair(cid, secret):
-        try:
-            OAUTH_CLIENT_CACHE.write_text(json.dumps({"pair": [cid, secret]}))
-            OAUTH_CLIENT_CACHE.chmod(0o600)
-        except Exception:
-            pass
-
-    @staticmethod
-    def _discover_client_pairs():
-        """Scan the public agy binary for Google OAuth client id + secret pairs.
-
-        Multiple ids and secrets sit adjacent in the binary; their pairing is
-        ambiguous from regex alone, so every id × secret combination is offered
-        and the correct pair self-selects at refresh time.
-        """
-        if not AGY_BINARY.exists():
-            return []
-        try:
-            blob = AGY_BINARY.read_bytes()
-        except Exception:
-            return []
-        ids = list(dict.fromkeys(
-            m.decode() for m in re.findall(
-                rb"[0-9]{10,}-[a-z0-9]+\.apps\.googleusercontent\.com", blob
-            )
-        ))
-        # Secrets are exactly "GOCSPX-" + 28 chars; anchor the length so two
-        # adjacent secrets don't get greedily spanned.
-        secrets = list(dict.fromkeys(
-            m.decode() for m in re.findall(
-                rb"GOCSPX-[A-Za-z0-9_\-]{28}", blob
-            )
-        ))
-        return [(cid, secret) for cid in ids for secret in secrets]
-
-    # --- refresh against Google OAuth -------------------------------------
-
-    def _refresh(self, refresh_token):
-        """Try each candidate pair until one mints a token. Cache the winner."""
-        for cid, secret in self._oauth_client_pairs():
-            body = urllib.parse.urlencode({
-                "client_id": cid,
-                "client_secret": secret,
-                "refresh_token": refresh_token,
-                "grant_type": "refresh_token",
-            }).encode()
-            status, text = http_post(
-                OAUTH_TOKEN_URL, body,
-                {"Content-Type": "application/x-www-form-urlencoded"},
-            )
-            if status == 200:
-                self._cache_client_pair(cid, secret)
-                data = json.loads(text)
-                return data["access_token"], time.time() + data.get("expires_in", 3000)
-        return None, 0
-
-
-# ---------------------------------------------------------------------------
-# CloudCode API client — live tier + quota
-# ---------------------------------------------------------------------------
-
-class CloudCodeClient:
-    def __init__(self, token):
-        self._headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-
-    def _call(self, verb, body):
-        status, text = http_post(
-            f"{CLOUDCODE_HOST}/{verb}", json.dumps(body).encode(), self._headers
-        )
-        if status == 200:
-            try:
-                return json.loads(text)
-            except Exception:
-                return None
-        return None
-
-    def tier(self):
-        """Return (tier_name, account_email) or (None, None)."""
-        data = self._call("v1internal:loadCodeAssist", {"metadata": {"pluginType": "GEMINI"}})
-        if not data:
-            return None, None
-        tier = (data.get("paidTier") or data.get("currentTier") or {}).get("name")
-        email = None
-        m = re.search(r"Email=([^&]+)", data.get("manageSubscriptionUri", ""))
-        if m:
-            email = urllib.parse.unquote(m.group(1))
-        return tier, email
-
-    def quota(self):
-        """Return list of quota buckets: [{modelId, tokenType, remainingFraction, resetTime}]."""
-        data = self._call("v1internal:retrieveUserQuota", {})
-        return data.get("buckets", []) if data else []
-
-
 # ---------------------------------------------------------------------------
 # PricingEngine — live per-million rates from LiteLLM (with stale fallback)
 # ---------------------------------------------------------------------------
@@ -450,10 +106,8 @@ class CloudCodeClient:
 class PricingEngine:
     """Per-million-token input/output rates fetched live from LiteLLM.
 
-    Antigravity does not persist per-token usage anywhere client-readable, so
-    we estimate cost from per-turn token assumptions × live rates. Rates are
-    always current; on fetch failure the last successful fetch is reused
-    (flagged stale). No pricing is bundled in source.
+    On failure the last successful fetch is reused (flagged stale).
+    No pricing is bundled in source.
     """
 
     PROVIDER_HINTS = ("gemini", "claude", "anthropic", "gpt-oss")
@@ -500,7 +154,6 @@ class PricingEngine:
         m = model.lower()
         if m in self.models:
             return self.models[m]
-        # Try the short id (after last slash) — LiteLLM keys vary.
         short = m.split("/")[-1]
         if short in self.models:
             return self.models[short]
@@ -512,8 +165,8 @@ class PricingEngine:
 
 # Approximate tokens per "model response" turn in agentic coding. Antigravity
 # does not persist real counts; these are typical ratios seen in Claude Code /
-# Cursor-style agents. Cost is an ESTIMATE — display it as such. Order matters:
-# first prefix match wins, so list more-specific prefixes before general ones.
+# Cursor-style agents. Cost is an ESTIMATE — README calls this out. Order
+# matters: first prefix match wins, so list more-specific prefixes first.
 ASSUMED_TOKENS_PER_TURN = [
     ("gemini-2.5-flash-lite", 3000, 400),
     ("gemini-2.5-flash",      4000, 500),
@@ -561,8 +214,7 @@ class ConversationStore:
 
     Reads `conversations/*.db` (SQLite) under both the CLI and Antigravity 2.0
     data dirs. All DBs are opened with `?mode=ro` so we never lock or mutate
-    Antigravity's live state. Aggregates per-month conversations, step counts,
-    and the per-model turn counts needed for cost estimation.
+    Antigravity's live state.
     """
 
     def __init__(self, dirs=None):
@@ -649,7 +301,7 @@ class ConversationStore:
     @staticmethod
     def _estimate_cost(pricing, model_turns):
         """Sum estimated cost across models using assumed per-turn tokens ×
-        live rates. Returns 0.0 if no models or no pricing."""
+        live rates."""
         if not pricing.models:
             return 0.0
         total = 0.0
@@ -670,25 +322,6 @@ class ConversationStore:
 # ---------------------------------------------------------------------------
 
 class Renderer:
-    def live(self, tier, email, buckets):
-        print("🛰️  Antigravity — Live Account")
-        who = f" ({email})" if email else ""
-        print(f"• Plan: {tier or 'unknown'}{who}")
-        if not buckets:
-            print("• Quota: unavailable")
-            return
-        print("• Quota remaining (resets per window):")
-        for b in sorted(buckets, key=lambda x: x.get("modelId", "")):
-            frac = b.get("remainingFraction", 0)
-            bar = self._bar(frac)
-            reset = (b.get("resetTime", "") or "")[:16].replace("T", " ")
-            print(f"    {b.get('modelId','?'):28} {bar} {frac*100:5.1f}%  ({b.get('tokenType','')}, reset {reset})")
-
-    @staticmethod
-    def _bar(frac, width=12):
-        filled = int(round(frac * width))
-        return "[" + "█" * filled + "·" * (width - filled) + "]"
-
     def activity(self, agg, pricing):
         """Render the per-month activity block in oc-usage / ccusage format:
         one header line, one bullet per month in the window showing estimated
@@ -721,51 +354,13 @@ class Renderer:
 # Main
 # ---------------------------------------------------------------------------
 
-def _format_deprecated_install_hook():
-    return (
-        "The --install-hook flag is deprecated and now a no-op.\n"
-        "Token capture via Antigravity hooks was removed because the Stop event\n"
-        "payload does not carry token counts (per Antigravity's official hook docs)\n"
-        "and Antigravity does not persist per-token usage in client-readable form.\n"
-        "\n"
-        "Conversation activity is now read directly from Antigravity's own local\n"
-        "SQLite stores — no hook required."
-    )
-
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Live quota + conversation activity for Google Antigravity."
-    )
-    parser.add_argument(
-        "--install-hook", action="store_true",
-        help="(deprecated, no-op) Previously installed a usage-capture hook.",
-    )
-    parser.add_argument(
-        "--no-live", action="store_true",
-        help="Skip the live CloudCode account/quota lookup (history only).",
-    )
-    args = parser.parse_args()
+    argparse.ArgumentParser(
+        description="Conversation activity + estimated cost for Google Antigravity."
+    ).parse_args()
 
-    if args.install_hook:
-        print(_format_deprecated_install_hook())
-        return
-
-    renderer = Renderer()
     pricing = PricingEngine()
-
-    if not args.no_live:
-        token = AntigravityAuth().access_token()
-        if token:
-            client = CloudCodeClient(token)
-            tier, email = client.tier()
-            renderer.live(tier, email, client.quota())
-        else:
-            print("🛰️  Antigravity — Live Account")
-            print("• Unavailable: no valid credentials. Sign in via the Antigravity app/CLI, then retry.")
-        print()  # separator between live block and activity block
-
-    renderer.activity(ConversationStore().aggregate(pricing), pricing)
+    Renderer().activity(ConversationStore().aggregate(pricing), pricing)
 
 
 if __name__ == "__main__":

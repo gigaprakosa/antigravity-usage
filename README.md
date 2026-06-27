@@ -1,15 +1,14 @@
 # Antigravity Usage
 
-A lightweight, zero-dependency CLI tool that reports your Google **Antigravity**
-account usage: live plan/quota straight from the API, plus conversation activity
-read directly from Antigravity's own local stores.
+A lightweight, zero-dependency CLI that reports Google **Antigravity**
+conversation activity and estimated cost for the last 2 months. Same
+one-line-per-month format as [`oc-usage`](https://github.com/sst/opencode)
+and [`ccusage`](https://github.com/ryoppippi/ccusage).
 
 ## Scope
 
-This tool tracks **Google Antigravity only** — the Antigravity CLI (`agy`) and
-the Antigravity IDE. The original **Gemini CLI is deprecated** (end of service
-**2026-06-18**, per Google's "Transitioning Gemini CLI to Antigravity CLI"
-announcement) and is intentionally **not** a data source.
+Google Antigravity only (CLI + IDE). The original **Gemini CLI is deprecated**
+(end of service 2026-06-18) and is intentionally **not** a data source.
 
 ## How it works
 
@@ -18,108 +17,53 @@ per-token usage to subscribers in any client-readable form. Local conversation
 files are SQLite + protobuf BLOBs (not encrypted, but token counts are not
 persisted in them), the JSONL transcripts carry no `UsageMetadata`, and the
 CloudCode API's `retrieveUserQuota` returns only REQUEST-type quota (not
-tokens). `retrieveUserQuotaSummary` is 403 for normal accounts.
+tokens).
 
-So this tool reports usage from the two authoritative client-readable sources:
+So this tool reads Antigravity's local SQLite conversation stores directly
+and aggregates per-month:
 
-1. **Live account** — queries the Google CloudCode API for your tier and
-   per-model quota remaining, authenticating with your existing Antigravity
-   session (no extra login).
-2. **Conversation activity** — reads Antigravity's local SQLite conversation
-   stores directly and aggregates them into per-month conversation counts,
-   step totals, and an **estimated** cost (assumed per-turn tokens × live
-   per-model rates from LiteLLM).
+- **Tokens** — estimated, from real per-model turn counts (extracted from
+  `gen_metadata` BLOBs) × assumed per-turn token sizes typical for agentic
+  coding.
+- **Cost** — those estimated tokens × live per-model rates from
+  [LiteLLM](https://github.com/BerriAI/litellm), fetched fresh every run.
 
-## Features
+Both figures are estimates — treat them as a ballpark, not an invoice.
 
-- **Live tier & quota:** plan name and per-model quota remaining with reset times.
-- **Conversation activity:** per-month conversations, steps, and estimated
-  cost — sourced from Antigravity's own `conversations/*.db`.
-- **Live pricing:** per-model rates fetched fresh from
-  [LiteLLM](https://github.com/BerriAI/litellm) every run, with last-good
-  cache reused (flagged stale) only if the source is unreachable.
-- **Read-only:** every SQLite store is opened with `?mode=ro` — Antigravity's
-  live state is never locked or mutated.
-- **Zero dependencies:** pure Python 3 standard library.
+## Install
 
-## Installation
-
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/gigaprakosa/antigravity-usage.git
-   cd antigravity-usage
-   ```
-
-2. Make the script executable:
-   ```bash
-   chmod +x antigravity-usage
-   ```
-
-3. (Optional) Add an alias or symlink for easier access:
-   ```bash
-   echo "alias antigravity-usage='$(pwd)/antigravity-usage'" >> ~/.zshrc
-   source ~/.zshrc
-   ```
+```bash
+git clone https://github.com/gigaprakosa/antigravity-usage.git
+cd antigravity-usage
+chmod +x antigravity-usage
+# optional: put it on your PATH
+ln -sf "$(pwd)/antigravity-usage ~/.local/bin/agy-usage"
+```
 
 ## Usage
 
-Show live account state plus conversation activity:
-
 ```bash
-antigravity-usage
+agy-usage
 ```
 
-Skip the live lookup and show activity only:
-
-```bash
-antigravity-usage --no-live
-```
-
-The `--install-hook` flag is **deprecated and a no-op**. An earlier version of
-this tool installed an Antigravity `Stop` hook to capture per-turn tokens; that
-approach was removed because the `Stop` event payload does not carry token
-counts (per Antigravity's official hook documentation at
-`antigravity.google/docs/hooks`) and Antigravity does not persist per-token
-usage client-side. Activity is now read directly from local stores, no hook
-needed.
+That's it — no flags, no subcommands.
 
 ### Example output
 
-`--no-live` (matches the `oc-usage` / `ccusage` one-line-per-month format):
-
 ```text
 📊 Antigravity Usage (last 2 months):
 • 2026-06: 7,211,600 tokens, Cost: $4.18
 ```
 
-Full run (adds the live account/quota block on top):
-
-```text
-🛰️  Antigravity — Live Account
-• Plan: Gemini Code Assist in Google One AI Pro (you@example.com)
-• Quota remaining (resets per window):
-    gemini-2.5-flash             [████████████] 100.0%  (REQUESTS, reset 2026-06-28 09:27)
-    gemini-2.5-pro               [████████████] 100.0%  (REQUESTS, reset 2026-06-28 09:27)
-
-📊 Antigravity Usage (last 2 months):
-• 2026-06: 7,211,600 tokens, Cost: $4.18
-```
-
-> **Both figures are estimates.** Antigravity does not persist per-token usage
-> client-readably, so tokens come from per-turn assumptions (typical for
-> agentic coding) × real per-model turn counts, and cost is those tokens ×
-> live per-model rates from [LiteLLM](https://github.com/BerriAI/litellm).
-> Treat the numbers as a ballpark, not an invoice. If the live pricing fetch
-> fails, the last good rates are reused and a `pricing is STALE` warning is
-> printed on stderr.
+If the live pricing fetch fails, the last good rates are reused and a
+`pricing is STALE` warning is printed on stderr.
 
 ## Data sources
 
-| Source | What it provides | Path / Endpoint |
-|--------|------------------|-----------------|
-| CloudCode API | Live tier + per-model quota | `cloudcode-pa.googleapis.com` (`loadCodeAssist`, `retrieveUserQuota`) |
-| Auth (refresh token) | Bearer for the API | Antigravity IDE `state.vscdb` (`antigravityUnifiedStateSync.oauthToken`), fallback `~/.gemini/oauth_creds.json` |
-| Conversation activity | Conversation count, step totals, model mix | `~/.gemini/antigravity-cli/conversations/*.db` and `~/.gemini/antigravity/conversations/*.db` (read-only) |
+| Source | What it provides | Path |
+|--------|------------------|------|
+| Conversation activity | Per-model turn counts | `~/.gemini/antigravity-cli/conversations/*.db` and `~/.gemini/antigravity/conversations/*.db` (read-only) |
+| Pricing | Live per-million rates | [LiteLLM raw JSON](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) |
 
 ## Contributing
 
