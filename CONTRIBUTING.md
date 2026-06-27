@@ -8,7 +8,7 @@ To keep the tool lightweight, fast, and secure, all contributions must adhere to
 
 1.  **Zero External Dependencies:** Use only the Python 3 standard library. Do not add `requirements.txt` or any third-party packages.
 2.  **Antigravity-only Scope:** Track Google Antigravity (CLI + IDE) only. Do not reintroduce the deprecated Gemini CLI as a data source.
-3.  **Cost Is Always An Estimate, Always Documented:** Antigravity does not persist per-token usage in any client-readable form (see `GEMINI.md` for the full investigation), so cost uses assumed per-turn tokens (`ASSUMED_TOKENS_PER_TURN` table) × live per-model rates from LiteLLM. If a future Antigravity release exposes real per-token usage, swap the estimate for the real calculation at that point.
+3.  **Cost Is Always An Estimate, Always Documented:** Antigravity does not persist per-token usage in any client-readable form (see `GEMINI.md` for the full investigation), so cost uses assumed per-turn tokens (`ASSUMED_TOKENS_PER_TURN` table) × live per-model rates from models.dev (same source oc-usage uses). If a future Antigravity release exposes real per-token usage, swap the estimate for the real calculation at that point.
 4.  **Read-only on Antigravity State:** Every SQLite open must use `?mode=ro`. Never lock or mutate Antigravity's live stores.
 5.  **Single Responsibility:** Each concern stays an isolated class (`PricingEngine`, `ConversationStore`, `Renderer`).
 

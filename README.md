@@ -26,7 +26,9 @@ and aggregates per-month:
   `gen_metadata` BLOBs) × assumed per-turn token sizes typical for agentic
   coding.
 - **Cost** — those estimated tokens × live per-model rates from
-  [LiteLLM](https://github.com/BerriAI/litellm), fetched fresh every run.
+  [models.dev](https://models.dev) (the same source
+  [`oc-usage`](https://github.com/sst/opencode) uses), fetched fresh every
+  run.
 
 Both figures are estimates — treat them as a ballpark, not an invoice.
 
@@ -63,7 +65,7 @@ If the live pricing fetch fails, the last good rates are reused and a
 | Source | What it provides | Path |
 |--------|------------------|------|
 | Conversation activity | Per-model turn counts | `~/.gemini/antigravity-cli/conversations/*.db` and `~/.gemini/antigravity/conversations/*.db` (read-only) |
-| Pricing | Live per-million rates | [LiteLLM raw JSON](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) |
+| Pricing | Live per-million rates | [models.dev](https://models.dev/api.json) (same source oc-usage uses) |
 
 ## Contributing
 

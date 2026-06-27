@@ -30,13 +30,14 @@ So usage is sourced from Antigravity's local conversation SQLite stores
 (`gen_metadata.data.field1.field19` gives the per-turn model id, which feeds
 both the per-month turn counts and the cost estimate). Cost is an
 **estimate**: assumed per-turn tokens (`ASSUMED_TOKENS_PER_TURN`) × live
-per-model rates from LiteLLM. The estimate is documented as such in the
+per-model rates from models.dev. The estimate is documented as such in the
 README because the real per-turn token counts are not recoverable.
 
 ## Architecture (SOLID, single-responsibility units)
-- **`PricingEngine`** — fetches live per-million rates from the LiteLLM
-  database every run; on failure falls back to the last successful cache,
-  flagged stale. No pricing is bundled in source.
+- **`PricingEngine`** — fetches live per-million rates from the models.dev
+  database every run (same source oc-usage uses, with the same generic
+  $0-subscription → real-rate resolution); on failure falls back to the
+  last successful cache, flagged stale. No pricing is bundled in source.
 - **`ConversationStore`** — opens `~/.gemini/antigravity-cli/conversations/*.db`
   and `~/.gemini/antigravity/conversations/*.db` in read-only SQLite mode and
   aggregates per-month: estimated tokens (real per-model turn counts from
@@ -49,7 +50,7 @@ README because the real per-turn token counts are not recoverable.
 - **Zero external dependencies** — standard library only.
 - **Cost is always an estimate, always documented.** Antigravity doesn't
   persist per-token usage client-readable, so cost uses assumed per-turn
-  tokens × live LiteLLM rates. If a future Antigravity release exposes real
+  tokens × live models.dev rates. If a future Antigravity release exposes real
   per-token usage, swap the estimate for the real calculation at that point.
 - **Read-only on Antigravity state** — every SQLite open uses `?mode=ro`.
 - **No AI Attribution** in commit messages.

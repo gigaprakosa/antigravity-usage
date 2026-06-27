@@ -12,12 +12,12 @@ not persist per-token usage in any client-readable form (transcripts discard
 UsageMetadata, the conversation SQLite stores carry step content but no
 token counts, retrieveUserQuota returns REQUEST-type quota only). So tokens
 come from per-turn assumptions × real per-model turn counts, and cost is
-those tokens × live per-model rates from LiteLLM.
+those tokens × live per-model rates from models.dev.
 
 Zero external dependencies — Python 3 standard library only.
 
 Design (SOLID): each concern is an isolated unit —
-  PricingEngine       → live per-million rates from LiteLLM
+  PricingEngine       → live per-million rates from models.dev
   ConversationStore   → read + aggregate Antigravity's conversation DBs
   Renderer            → format output
 """
@@ -26,7 +26,6 @@ import argparse
 import json
 import sqlite3
 import sys
-import time
 import urllib.error
 import urllib.request
 from collections import defaultdict, Counter
@@ -45,9 +44,10 @@ CONVERSATION_DIRS = [
 # Report window: current month + previous (N-1) months.
 MONTHS_BACK = 2
 
-# Pricing cache (owner-only). Live per-million-token rates come from LiteLLM.
-PRICING_CACHE = HOME / ".gemini/antigravity-usage-pricing-cache.json"
-LITELLM_PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+# Pricing cache (owner-only). Live per-million-token rates come from models.dev
+# (same source oc-usage uses). Cache is XDG-style: ~/.cache/antigravity-usage/.
+PRICING_CACHE = HOME / ".cache/antigravity-usage/models-dev.json"
+MODELS_DEV_URL = "https://models.dev/api.json"
 
 
 # ---------------------------------------------------------------------------
@@ -100,65 +100,99 @@ def proto_fields(buf):
 
 
 # ---------------------------------------------------------------------------
-# PricingEngine — live per-million rates from LiteLLM (with stale fallback)
+# PricingEngine — live per-million rates from models.dev (with stale fallback)
 # ---------------------------------------------------------------------------
 
-class PricingEngine:
-    """Per-million-token input/output rates fetched live from LiteLLM.
+RATE_KEYS = ("input", "output", "cache_read", "cache_write")
 
-    On failure the last successful fetch is reused (flagged stale).
-    No pricing is bundled in source.
+
+def _has_rate(cost):
+    """True when a models.dev cost dict carries any non-zero per-token rate."""
+    return bool(cost) and any((cost.get(k) or 0) > 0 for k in RATE_KEYS)
+
+
+class PricingEngine:
+    """USD pricing using models.dev (the same source oc-usage uses).
+
+    Rates are USD per 1,000,000 tokens. A model that models.dev prices at $0
+    (a flat-rate subscription plan) is resolved to the real pay-as-you-go
+    rate of the same model id under any paid provider — generically, with no
+    provider or model names hardcoded. The on-disk cache at PRICING_CACHE is
+    written after each successful fetch and used only as a fallback when the
+    live fetch fails (offline); in that case the `stale` flag is set.
     """
 
-    PROVIDER_HINTS = ("gemini", "claude", "anthropic", "gpt-oss")
-
     def __init__(self):
-        self.models, self.as_of, self.stale = self._load()
+        self.stale = False
+        self.data = self._load()
+        self.models = self._index_real_rates(self.data)
 
+    # --- loading -----------------------------------------------------------
     def _load(self):
-        raw = http_get_json(LITELLM_PRICING_URL)
-        if raw:
-            models = {}
-            for key, val in raw.items():
-                kl = key.lower()
-                if not any(h in kl for h in self.PROVIDER_HINTS):
-                    continue
-                ic = val.get("input_cost_per_token")
-                oc = val.get("output_cost_per_token")
-                if ic:
-                    models[key.split("/")[-1].lower()] = {
-                        "input": ic * 1_000_000,
-                        "output": (oc or 0) * 1_000_000,
-                    }
-            if models:
-                as_of = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            req = urllib.request.Request(
+                MODELS_DEV_URL, headers={"User-Agent": "antigravity-usage"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read()
+            data = json.loads(raw)
+            self._write_cache(raw)
+            return data
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+            self.stale = True
+            if PRICING_CACHE.exists():
                 try:
-                    PRICING_CACHE.write_text(json.dumps({"models": models, "as_of": as_of}))
-                    PRICING_CACHE.chmod(0o600)
-                except Exception:
+                    return json.loads(PRICING_CACHE.read_text())
+                except (json.JSONDecodeError, OSError):
                     pass
-                return models, as_of, False
-        if PRICING_CACHE.exists():
-            try:
-                c = json.loads(PRICING_CACHE.read_text())
-                return c["models"], c.get("as_of", "unknown"), True
-            except Exception:
-                pass
-        return {}, None, True
+            return {}
 
+    @staticmethod
+    def _write_cache(raw):
+        try:
+            PRICING_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            PRICING_CACHE.write_bytes(raw)
+            PRICING_CACHE.chmod(0o600)
+        except OSError:
+            pass  # caching is best-effort, never fatal
+
+    @staticmethod
+    def _index_real_rates(data):
+        """model_id -> best non-zero cost dict across all providers.
+
+        "best" = highest output rate so a subscription-priced model resolves
+        to its real paid twin regardless of how many providers list the same
+        id. Matches oc-usage's resolution strategy.
+        """
+        best = {}
+        for prov in sorted(data):
+            for model_id, m in (data[prov].get("models") or {}).items():
+                cost = m.get("cost") or {}
+                if not _has_rate(cost):
+                    continue
+                cur = best.get(model_id)
+                if cur is None or (cost.get("output") or 0) > (cur.get("output") or 0):
+                    best[model_id] = cost
+        return best
+
+    # --- resolution --------------------------------------------------------
     def rate(self, model):
-        """Return {'input','output'} per-million rates via exact then fuzzy
-        match, or None if unrated."""
+        """Return cost dict {input, output, cache_read?, cache_write?} or None.
+
+        Rates are USD per 1,000,000 tokens. Exact match first, then fuzzy
+        (longest key wins, so 'gemini-3-flash-preview' beats 'gemini-3-flash'
+        when matching 'gemini-3-flash-preview-thinking').
+        """
         if not self.models:
             return None
         m = model.lower()
+        # Exact (case-insensitive).
         if m in self.models:
             return self.models[m]
-        short = m.split("/")[-1]
-        if short in self.models:
-            return self.models[short]
+        # Fuzzy: longest key first (prefers specificity).
         for key in sorted(self.models, key=len, reverse=True):
-            if key in m or m in key:
+            kl = key.lower()
+            if kl in m or m in kl:
                 return self.models[key]
         return None
 
@@ -330,13 +364,12 @@ class Renderer:
         Both figures are estimates: Antigravity doesn't persist per-token
         usage client-readably, so tokens come from the ASSUMED_TOKENS_PER_TURN
         table × real per-model turn counts, and cost is those tokens × live
-        LiteLLM rates. Stale pricing (live fetch failed) is flagged on stderr.
+        models.dev rates. Stale pricing (live fetch failed) is flagged on stderr.
         """
         print(f"📊 Antigravity Usage (last {MONTHS_BACK} months):")
         if pricing and pricing.stale:
             print(
-                f"  ⚠ pricing is STALE (live LiteLLM fetch failed; "
-                f"using cached rates from {pricing.as_of})",
+                "  ⚠ pricing is STALE (live models.dev fetch failed; using cached prices)",
                 file=sys.stderr,
             )
         start_month = _window_start_month()
