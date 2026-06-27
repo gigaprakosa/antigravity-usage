@@ -92,14 +92,8 @@ needed.
     gemini-2.5-flash             [████████████] 100.0%  (REQUESTS, reset 2026-06-28 09:27)
     gemini-2.5-pro               [████████████] 100.0%  (REQUESTS, reset 2026-06-28 09:27)
 
-📂 Conversation activity (local stores):
-• 44 conversations, 3,036 steps over 23 days (2026-06-05 → 2026-06-27)
-• By month:
-    2026-06:   44 conversations,  3,036 steps
-• Models used (1,278 turns recorded):
-    gemini-3-flash-a                935 turns ( 73.2%)
-    gemini-pro-default              221 turns ( 17.3%)
-    claude-sonnet-4-6               121 turns (  9.5%)
+📊 Antigravity Usage (last 2 months):
+• 2026-06: 44 conversations, 3,036 steps
 ```
 
 > Activity accrues from the moment Antigravity first runs and writes to its

@@ -40,7 +40,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import defaultdict, Counter
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -67,6 +67,9 @@ CONVERSATION_DIRS = [
     HOME / ".gemini/antigravity-cli/conversations",
     HOME / ".gemini/antigravity/conversations",
 ]
+
+# Report window: current month + previous (N-1) months.
+MONTHS_BACK = 2
 
 # Per-run caches (owner-only).
 TOKEN_CACHE = HOME / ".gemini/antigravity-usage-token.json"
@@ -430,52 +433,33 @@ class CloudCodeClient:
 # ConversationStore — read Antigravity's local SQLite stores (read-only)
 # ---------------------------------------------------------------------------
 
+def _window_start_month():
+    """Return YYYY-MM string for the first month in the report window.
+
+    MONTHS_BACK=2 → window is the current month plus the previous one.
+    String comparison works because YYYY-MM sorts chronologically.
+    """
+    now = datetime.now()
+    month_index = now.year * 12 + (now.month - 1) - (MONTHS_BACK - 1)
+    year, month0 = divmod(month_index, 12)
+    return f"{year:04d}-{month0 + 1:02d}"
+
+
 class ConversationStore:
     """Aggregates conversation activity from Antigravity's local stores.
 
-    Reads `conversations/*.db` (SQLite + protobuf BLOBs) under both the CLI
-    and Antigravity 2.0 data dirs. All DBs are opened with `?mode=ro` so we
-    never lock or mutate Antigravity's live state.
-
-    What we reliably extract:
-      • Conversation count
-      • Step counts (per step_type, per month)
-      • Models used (from gen_metadata.field1.field19 — short model id like
-        "gemini-3-flash-a", "claude-sonnet-4-6")
-      • Date range (from file mtime as a proxy for last activity)
+    Reads `conversations/*.db` (SQLite) under both the CLI and Antigravity 2.0
+    data dirs. All DBs are opened with `?mode=ro` so we never lock or mutate
+    Antigravity's live state. Aggregates just what the simple per-month report
+    needs: conversations and step counts.
     """
-
-    # Cortex step_type values, decoded from the agy binary's
-    # `jetski_cortex_go_proto.CortexStepType` enum. Only the most common
-    # user-facing types are labeled; unknown types fall through to "other".
-    STEP_TYPE_LABELS = {
-        14: "User input",
-        15: "Model response",
-        98: "Subagent call",
-        8:  "Tool call",
-        9:  "Tool call",
-        21: "Tool call",
-        23: "Tool call",
-        5:  "Tool call",
-        7:  "Tool call",
-        90: "Background task",
-    }
 
     def __init__(self, dirs=None):
         self.dirs = [Path(d) for d in (dirs or CONVERSATION_DIRS)]
 
     def aggregate(self):
-        """Return dict with conversation_count, step_total, by_month,
-        by_step_type, models, first_seen, last_seen."""
-        out = {
-            "conversation_count": 0,
-            "step_total": 0,
-            "by_month": defaultdict(lambda: {"conversations": 0, "steps": 0}),
-            "by_step_type": Counter(),
-            "models": Counter(),
-            "first_seen": None,
-            "last_seen": None,
-        }
+        """Return dict with by_month: {YYYY-MM: {conversations, steps}}."""
+        out = {"by_month": defaultdict(lambda: {"conversations": 0, "steps": 0})}
         seen_paths = set()
         for d in self.dirs:
             if not d.exists():
@@ -493,70 +477,31 @@ class ConversationStore:
         except sqlite3.Error:
             return
         try:
-            # Step counts + per-step-type breakdown
+            # Sum all steps in this conversation.
+            conv_steps = 0
             try:
-                cur = con.execute(
-                    "SELECT step_type, COUNT(*) FROM steps GROUP BY step_type"
-                )
-                conv_steps = 0
-                for st, c in cur.fetchall():
-                    out["by_step_type"][int(st)] += int(c)
-                    conv_steps += int(c)
-                out["step_total"] += conv_steps
+                cur = con.execute("SELECT COUNT(*) FROM steps")
+                row = cur.fetchone()
+                if row:
+                    conv_steps = int(row[0])
             except sqlite3.Error:
-                conv_steps = 0
+                pass
 
-            out["conversation_count"] += 1
-
-            # Per-month bucketing by file mtime (UTC). Per-row timestamps inside
-            # the protobuf are unreliable to extract without the full schema;
-            # mtime is a robust proxy for "when this conversation was active".
+            # Bucket by month using the DB's mtime (UTC). Per-step timestamps
+            # live inside protobuf BLOBs without a published schema; mtime is a
+            # robust proxy for "when this conversation was last active".
             try:
                 m = db_path.stat().st_mtime
                 month = datetime.fromtimestamp(m, tz=timezone.utc).strftime("%Y-%m")
                 out["by_month"][month]["conversations"] += 1
                 out["by_month"][month]["steps"] += conv_steps
-                if out["first_seen"] is None or m < out["first_seen"]:
-                    out["first_seen"] = m
-                if out["last_seen"] is None or m > out["last_seen"]:
-                    out["last_seen"] = m
             except OSError:
-                pass
-
-            # Model breakdown from gen_metadata BLOBs.
-            # Structure: gen_metadata.data.field1.field19 = short model id.
-            try:
-                cur = con.execute("SELECT data FROM gen_metadata")
-                for (data,) in cur.fetchall():
-                    if not isinstance(data, (bytes, bytearray)):
-                        continue
-                    model = self._extract_model(data)
-                    if model:
-                        out["models"][model] += 1
-            except sqlite3.Error:
                 pass
         finally:
             try:
                 con.close()
             except Exception:
                 pass
-
-    @staticmethod
-    def _extract_model(gen_meta_blob):
-        """gen_metadata.field1 (nested proto).field19 = short model id."""
-        for fn, wire, val in proto_fields(gen_meta_blob):
-            if fn == 1 and wire == 2:
-                for sfn, swire, sval in proto_fields(val):
-                    if sfn == 19 and swire == 2:
-                        try:
-                            return sval.decode("utf-8")
-                        except Exception:
-                            return None
-        return None
-
-    @staticmethod
-    def label_step_type(step_type):
-        return ConversationStore.STEP_TYPE_LABELS.get(step_type, "other")
 
 
 # ---------------------------------------------------------------------------
@@ -584,42 +529,17 @@ class Renderer:
         return "[" + "█" * filled + "·" * (width - filled) + "]"
 
     def activity(self, agg):
-        print("\n📂 Conversation activity (local stores):")
-        if agg["conversation_count"] == 0:
-            print("   No conversations found. Use Antigravity, then re-run.")
+        """Render the per-month activity block (opencode-usage-style: header +
+        one bullet per month in the window)."""
+        print(f"\n📊 Antigravity Usage (last {MONTHS_BACK} months):")
+        start_month = _window_start_month()
+        months = sorted(m for m in agg["by_month"] if m >= start_month)
+        if not months:
+            print(f"• no activity in the last {MONTHS_BACK} months")
             return
-
-        # Totals + date range
-        if agg["first_seen"] and agg["last_seen"]:
-            first = datetime.fromtimestamp(agg["first_seen"], tz=timezone.utc).date()
-            last = datetime.fromtimestamp(agg["last_seen"], tz=timezone.utc).date()
-            span = (last - first).days + 1
-            print(
-                f"• {agg['conversation_count']:,} conversations, "
-                f"{agg['step_total']:,} steps over {span} days "
-                f"({first} → {last})"
-            )
-        else:
-            print(
-                f"• {agg['conversation_count']:,} conversations, "
-                f"{agg['step_total']:,} steps"
-            )
-
-        # Per-month breakdown
-        months = sorted(agg["by_month"].keys())
-        if months:
-            print("• By month:")
-            for month in months:
-                m = agg["by_month"][month]
-                print(f"    {month}: {m['conversations']:>4} conversations, {m['steps']:>6,} steps")
-
-        # Models used
-        if agg["models"]:
-            total = sum(agg["models"].values())
-            print(f"• Models used ({total:,} turns recorded):")
-            for model, count in agg["models"].most_common():
-                pct = count * 100.0 / total if total else 0
-                print(f"    {model:28} {count:>6,} turns ({pct:5.1f}%)")
+        for month in months:
+            m = agg["by_month"][month]
+            print(f"• {month}: {m['conversations']:,} conversations, {m['steps']:,} steps")
 
 
 # ---------------------------------------------------------------------------
