@@ -74,3 +74,13 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for det
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
+
+## Compatibility checkpoint
+
+Run regression checks with `python3 -m unittest discover -v` and syntax checks
+with `python3 -m py_compile antigravity-usage`. No typechecker is configured.
+
+The App, CLI, and separate IDE conversation directories are scanned for
+SQLite stores, including `~/.gemini/antigravity-ide/conversations`.
+Legacy `.pb` history is not decoded yet, so full IDE compatibility is pending.
+Tokens are labeled estimated in CLI output. Missing pricing displays unknown.

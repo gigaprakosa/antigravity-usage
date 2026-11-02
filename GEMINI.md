@@ -58,3 +58,10 @@ README because the real per-turn token counts are not recoverable.
 ## Release Process
 - Update `README.md` whenever features change (source of truth).
 - Commit using Conventional Commits.
+
+## Compatibility verification
+
+Run `python3 -m unittest discover -v` and
+`python3 -m py_compile antigravity-usage`. SQLite discovery includes the
+separate `antigravity-ide` directory. Legacy `.pb` decoding remains unsupported;
+do not claim full IDE compatibility. See README.md for current limitations.

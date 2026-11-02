@@ -32,3 +32,10 @@ The project is a standalone Python script. No installation is required.
 ## Code of Conduct
 
 Be respectful, professional, and constructive in all interactions.
+
+## Compatibility verification
+
+Run `python3 -m unittest discover -v` and
+`python3 -m py_compile antigravity-usage`. SQLite discovery includes the
+separate `antigravity-ide` directory. Legacy `.pb` decoding remains unsupported;
+do not claim full IDE compatibility. See README.md for current limitations.

@@ -39,6 +39,7 @@ HOME = Path.home()
 CONVERSATION_DIRS = [
     HOME / ".gemini/antigravity-cli/conversations",
     HOME / ".gemini/antigravity/conversations",
+    HOME / ".gemini/antigravity-ide/conversations",
 ]
 
 # Report window: current month + previous (N-1) months.
@@ -70,6 +71,8 @@ def http_get_json(url, timeout=30):
 def _read_varint(buf, i):
     val = shift = 0
     while True:
+        if i >= len(buf) or shift >= 70:
+            raise ValueError("invalid protobuf varint")
         b = buf[i]
         val |= (b & 0x7F) << shift
         i += 1
@@ -89,6 +92,8 @@ def proto_fields(buf):
             yield field_num, 0, val
         elif wire == 2:  # length-delimited
             length, i = _read_varint(buf, i)
+            if i + length > n:
+                raise ValueError("truncated protobuf field")
             yield field_num, 2, buf[i:i + length]
             i += length
         elif wire == 5:  # 32-bit
@@ -186,6 +191,8 @@ class PricingEngine:
         if not self.models:
             return None
         m = model.lower()
+        if not m:
+            return None
         # Exact (case-insensitive).
         if m in self.models:
             return self.models[m]
@@ -292,7 +299,11 @@ class ConversationStore:
                 for (data,) in cur.fetchall():
                     if not isinstance(data, (bytes, bytearray)):
                         continue
-                    model = self._extract_model(data)
+                    try:
+                        model = self._extract_model(data)
+                    except ValueError:
+                        print("warning: invalid model metadata skipped", file=sys.stderr)
+                        continue
                     if model:
                         conv_models[model] += 1
             except sqlite3.Error:
@@ -379,8 +390,8 @@ class Renderer:
             return
         for month in months:
             m = agg["by_month"][month]
-            cost_str = f", Cost: ${m['cost']:,.2f}" if pricing and pricing.models else ""
-            print(f"• {month}: {m['tokens']:,} tokens{cost_str}")
+            cost_str = f", Cost: ${m['cost']:,.2f}" if pricing and pricing.models else ", Cost: unknown"
+            print(f"• {month}: {m['tokens']:,} estimated tokens{cost_str}")
 
 
 # ---------------------------------------------------------------------------
