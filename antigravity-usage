@@ -2,8 +2,8 @@
 """Antigravity Usage — conversation activity + estimated cost for Google
 Antigravity.
 
-Scope: Google Antigravity only (CLI + IDE). The legacy Gemini CLI is
-deprecated (EOL 2026-06-18) and is intentionally NOT a data source here.
+Scope: Google Antigravity CLI only. The separate Gemini CLI is not a data
+source.
 
 Reads Antigravity's local SQLite conversation stores directly and reports
 per-month tokens and cost for the last 2 months — same one-line-per-month
@@ -34,12 +34,9 @@ from pathlib import Path
 
 HOME = Path.home()
 
-# Conversation stores. Antigravity CLI writes under antigravity-cli/; the
-# Antigravity 2.0 IDE uses antigravity/ with the same SQLite schema.
+# Only the dedicated CLI store belongs in this report.
 CONVERSATION_DIRS = [
     HOME / ".gemini/antigravity-cli/conversations",
-    HOME / ".gemini/antigravity/conversations",
-    HOME / ".gemini/antigravity-ide/conversations",
 ]
 
 # Report window: current month + previous (N-1) months.
@@ -253,9 +250,8 @@ def _window_start_month():
 class ConversationStore:
     """Aggregates conversation activity from Antigravity's local stores.
 
-    Reads `conversations/*.db` (SQLite) under both the CLI and Antigravity 2.0
-    data dirs. All DBs are opened with `?mode=ro` so we never lock or mutate
-    Antigravity's live state.
+    Reads `conversations/*.db` (SQLite) under the dedicated CLI data dir.
+    All DBs use `?mode=ro` to prevent writes to Antigravity's live state.
     """
 
     def __init__(self, dirs=None):
@@ -400,7 +396,7 @@ class Renderer:
 
 def main():
     argparse.ArgumentParser(
-        description="Conversation activity + estimated cost for Google Antigravity."
+        description="Conversation activity + estimated cost for Google Antigravity CLI."
     ).parse_args()
 
     pricing = PricingEngine()
